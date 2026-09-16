@@ -17,9 +17,11 @@
 #   1. build-only（硬性门槛）：`docker build -f Dockerfile.codespace` 构建 linux/amd64
 #      成功，证明该形态在 python:3.12-slim 下依赖安装、apt 装 PG16/Redis、构建期
 #      provision（initdb）全链路可用；
-#   2. smoke（尽力而为，非阻断）：起单容器并轮询 http://localhost:7860/ 与
-#      /mcp/health，验证 supervisord 能把 PG + Redis + node-server + main +
-#      tunnel-server 拉起来、main 自己绑 7860 并应答。
+#   2. smoke（硬性门槛）：起单容器并轮询 http://localhost:7860/ 与 /mcp/health，
+#      验证 supervisord 能把 PG + Redis + node-server + main + tunnel-server 拉起来、
+#      main 自己绑 7860 并应答。首次纳入 CI 时该形态在运行期即失败（见
+#      deliverables/fork-ci-report.md 第九章），修复后本步骤已稳定通过，故设为**阻断**，
+#      以防回归；失败时同一步内导出各 program 日志便于定位。
 #
 # 不推送镜像：本流只做构建校验（该形态由创空间平台按 deploy_schema.json 自行构建）。
 #
@@ -82,10 +84,10 @@ jobs:
           cache-from: type=gha,scope=codespace-amd64
           cache-to: type=gha,mode=max,scope=codespace-amd64
 
-      # 尽力而为的冒烟：非阻断（continue-on-error）。构建已成功即达成本流硬性目标；
-      # 冒烟失败只作为告警暴露（日志在同一步内导出），不影响 build 门槛结论。
+      # 冒烟：起单容器，轮询 7860 的 /mcp/health（200 即就绪）与 /。
+      # 阻断式门槛：该形态此前在运行期失败（PG 起不来 / 目标库不存在），修复后稳定通过；
+      # 失败时在同一 step 内导出 supervisord stdout、supervisorctl status、各 program 日志。
       - name: 冒烟（起单容器，轮询 7860 / /mcp/health）
-        continue-on-error: true
         run: |
           set -euo pipefail
           ADMIN_PW="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
@@ -106,20 +108,20 @@ jobs:
             fi
             sleep 5
           done
-          echo "===== supervisord stdout (tail 60) ====="
-          docker logs ai-lubricant-codespace --tail 60 || true
-          echo "===== supervisorctl status ====="
-          docker exec ai-lubricant-codespace supervisorctl \
-            -c /opt/ailubricant/runtime/config/supervisord-native.conf status 2>&1 || true
-          echo "===== per-program logs (tail) ====="
-          docker exec ai-lubricant-codespace sh -lc '
-            for f in /opt/ailubricant/runtime/logs/*.log; do
-              echo "----- ${f} -----"; tail -n 80 "${f}" 2>/dev/null || true;
-            done' 2>&1 || true
-          echo "===== listening sockets ====="
-          docker exec ai-lubricant-codespace sh -lc 'ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || true' 2>&1 || true
           if [ "${ok}" != "1" ]; then
-            echo "::warning::codespace 冒烟未在预期时间内就绪（非阻断；build 已成功）"
+            echo "::error::codespace 冒烟未在预期时间内就绪"
+            echo "===== supervisord stdout (tail 60) ====="
+            docker logs ai-lubricant-codespace --tail 60 || true
+            echo "===== supervisorctl status ====="
+            docker exec ai-lubricant-codespace supervisorctl \
+              -c /opt/ailubricant/runtime/config/supervisord-native.conf status 2>&1 || true
+            echo "===== per-program logs (tail) ====="
+            docker exec ai-lubricant-codespace sh -lc '
+              for f in /opt/ailubricant/runtime/logs/*.log; do
+                echo "----- ${f} -----"; tail -n 80 "${f}" 2>/dev/null || true;
+              done' 2>&1 || true
+            echo "===== listening sockets ====="
+            docker exec ai-lubricant-codespace sh -lc 'ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || true' 2>&1 || true
             exit 1
           fi
           echo "health OK:"
