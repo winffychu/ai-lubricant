@@ -1,0 +1,122 @@
+# 创空间（托管单容器）形态 CI 覆盖：构建 Dockerfile.codespace（必须）+ 起容器冒烟（尽力）。
+#
+# 背景：仓库里有两种镜像形态——
+#   * 根 Dockerfile + docker-compose.yml（多容器，compose 形态）→ 由 acceptance.yml 覆盖；
+#   * Dockerfile.codespace + deploy/codespace/entrypoint.sh（单容器，创空间形态）
+#     → 本工作流覆盖。二者构建上下文相同，但 codespace 形态在**构建期**额外
+#       用 apt 装 PostgreSQL 16 + Redis 并跑一次 `python -m native_deps.cli provision`
+#       （initdb、写 .env、生成密钥），因此单独成流、独立超时与缓存作用域，
+#       不与 acceptance.yml 互相拖慢/影响。
+#
+# 触发：
+#   - push 到 main
+#   - pull_request 到 main
+#   - workflow_dispatch 手动触发
+#
+# 目标：
+#   1. build-only（硬性门槛）：`docker build -f Dockerfile.codespace` 构建 linux/amd64
+#      成功，证明该形态在 python:3.12-slim 下依赖安装、apt 装 PG16/Redis、构建期
+#      provision（initdb）全链路可用；
+#   2. smoke（尽力而为，非阻断）：起单容器并轮询 http://localhost:7860/ 与
+#      /mcp/health，验证 supervisord 能把 PG + Redis + node-server + main +
+#      tunnel-server 拉起来、main 自己绑 7860 并应答。
+#
+# 不推送镜像：本流只做构建校验（该形态由创空间平台按 deploy_schema.json 自行构建）。
+#
+# 注意：子模块随镜像提供 user-frontend/dist（SPA）。.gitmodules 用相对 URL
+#   （../ai-lubricant-*.git），在 fork 里会解析成不存在的 winffychu/ai-lubricant-*.git，
+#   故先改写到上游 wuxin-gh 再初始化（与 ci.yml / acceptance.yml 一致）。
+
+name: Codespace Image CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: codespace-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-smoke:
+    name: build Dockerfile.codespace & smoke (amd64)
+    runs-on: ubuntu-latest
+    # codespace 构建期要 apt 装 PG16/Redis 并跑 initdb，比 compose 形态慢，
+    # 给足 60 分钟（GHA 缓存命中后通常 10~20 分钟）。
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # user-frontend/dist 随子模块提交，镜像依赖它（SPA 挂 /admin-static）。
+      - name: 检出子模块（改写到上游 wuxin-gh，user-frontend/dist 随子模块提供）
+        run: |
+          git config --global url."https://github.com/wuxin-gh/".insteadOf "https://github.com/winffychu/"
+          git submodule update --init --recursive --depth 1
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 硬性门槛：构建成功即代表 codespace 形态可用。
+      # 加载到本地 daemon，供后续 smoke 直接运行（同 job 内共享镜像，避免重复构建）。
+      - name: 构建镜像（codespace 形态，linux/amd64，加载到本地 daemon）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile.codespace
+          platforms: linux/amd64
+          load: true
+          tags: ai-lubricant-codespace:ci
+          # codespace Dockerfile 的默认 pip 源是清华镜像（面向国内构建）；
+          # GitHub runner 直连 pypi.org，显式改回官方源，与 ci.yml/acceptance.yml 一致。
+          build-args: |
+            PIP_INDEX_URL=https://pypi.org/simple
+            DOCKER_REGISTRY_PREFIX=
+          cache-from: type=gha,scope=codespace-amd64
+          cache-to: type=gha,mode=max,scope=codespace-amd64
+
+      # 尽力而为的冒烟：非阻断（continue-on-error）。构建已成功即达成本流硬性目标；
+      # 冒烟失败只作为告警暴露（日志在同一步内导出），不影响 build 门槛结论。
+      - name: 冒烟（起单容器，轮询 7860 / /mcp/health）
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+          ADMIN_PW="$(python -c 'import secrets; print(secrets.token_urlsafe(24))')"
+          docker run -d --name ai-lubricant-codespace \
+            -p 7860:7860 \
+            -e AI_LUBRICANT_BOOTSTRAP_ADMIN_EMAIL=ci@example.com \
+            -e AI_LUBRICANT_BOOTSTRAP_ADMIN_PASSWORD="${ADMIN_PW}" \
+            ai-lubricant-codespace:ci
+          # 等 supervisord 把 PG/Redis/main 拉起来；main 自己绑 7860。
+          ok=0
+          for i in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7860/mcp/health || true)
+            root=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7860/ || true)
+            echo "attempt $i: /mcp/health -> ${code} ; / -> ${root}"
+            if [ "${code}" = "200" ]; then ok=1; break; fi
+            if [ "$(docker inspect -f '{{.State.Running}}' ai-lubricant-codespace 2>/dev/null)" != "true" ]; then
+              echo "container exited early"; break
+            fi
+            sleep 5
+          done
+          echo "===== container logs (tail 200) ====="
+          docker logs ai-lubricant-codespace --tail 200 || true
+          if [ "${ok}" != "1" ]; then
+            echo "::warning::codespace 冒烟未在预期时间内就绪（非阻断；build 已成功）"
+            exit 1
+          fi
+          echo "health OK:"
+          curl -fsS http://localhost:7860/mcp/health; echo
+          curl -fsS -o /dev/null -w 'GET / -> %{http_code}\n' http://localhost:7860/
+
+      - name: 清理
+        if: always()
+        run: |
+          docker rm -f ai-lubricant-codespace >/dev/null 2>&1 || true
