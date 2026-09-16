@@ -83,6 +83,18 @@ RUN mkdir -p "${NATIVE_DEPS_ROOT}" && chown -R app:app "${NATIVE_DEPS_ROOT}" \
     && su app -c 'cd /app && python -m native_deps.cli provision' \
     && chown -R app:app "${NATIVE_DEPS_ROOT}" /app
 
+# ---- PG unix socket 目录（非 root 运行必需）----
+# PostgreSQL 启动时要在 socket 目录建锁文件 .s.PGSQL.<port>.lock。Debian/Ubuntu 的 PG
+# 编译默认 unix_socket_directories=/var/run/postgresql，而该目录归 postgres 用户；本镜像
+# 以 app(uid 1000) 运行 postgres，会 FATAL: could not create lock file ... Permission denied
+# → PG 起不来 → main/node-server/tunnel-server 全部连库失败、对外 7860 无应答。
+# 把 socket 目录改到 app 自有、随镜像层保留的 ${NATIVE_DEPS_ROOT}/run（不依赖 /run 的
+# 挂载方式）；客户端一律走 TCP(127.0.0.1)，该目录仅用于锁文件/本地 socket。
+RUN printf "\n# codespace overlay: writable socket dir for the non-root app user\nunix_socket_directories = '%s'\n" "${NATIVE_DEPS_ROOT}/run" \
+        >> "${NATIVE_DEPS_ROOT}/data/postgres/postgresql.conf" \
+    && install -d -o app -g app "${NATIVE_DEPS_ROOT}/run" \
+    && chown app:app "${NATIVE_DEPS_ROOT}/data/postgres/postgresql.conf"
+
 # ---- 管理员账号 ----
 # 不在镜像里烘焙凭据：由平台在**运行时**注入环境变量（创空间的
 # deploy_schema.json → environment_variables）：
