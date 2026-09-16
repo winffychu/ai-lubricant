@@ -76,6 +76,10 @@ jobs:
           # 容器内通过自定义网络的容器名访问依赖服务。
           text = text.replace("POSTGRES_HOST=127.0.0.1", "POSTGRES_HOST=postgres")
           text = text.replace("REDIS_HOST=127.0.0.1", "REDIS_HOST=redis")
+          # .env.example 的 PG 凭据是占位值（your_pg_user/your_pg_password），
+          # 必须改成与下面 postgres 容器一致的真实凭据，否则 asyncpg 会鉴权失败。
+          text = text.replace("POSTGRES_USER=your_pg_user", "POSTGRES_USER=ai_lubricant")
+          text = text.replace("POSTGRES_PASSWORD=your_pg_password", "POSTGRES_PASSWORD=ai_lubricant")
           # 三个共享密钥必须非空（留空会触发容器内自动写回 .env）。
           text = text.replace(
               "NODE_CONTROL_TOKEN=",
@@ -128,7 +132,12 @@ jobs:
           docker run -d --name ai-lubricant --network ai-lubricant-ci \
             --env-file .env \
             -e POSTGRES_HOST=postgres \
+            -e POSTGRES_PORT=5432 \
+            -e POSTGRES_USER=ai_lubricant \
+            -e POSTGRES_PASSWORD=ai_lubricant \
+            -e POSTGRES_DATABASE=ai-lubricant \
             -e REDIS_HOST=redis \
+            -e REDIS_PORT=6379 \
             -e SERVER_PORT=8001 \
             -e DEBUG=false \
             -p 3006:8001 \
