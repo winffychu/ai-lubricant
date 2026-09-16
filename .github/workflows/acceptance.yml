@@ -40,10 +40,15 @@ jobs:
     timeout-minutes: 60
 
     steps:
-      - name: Checkout（含子模块，user-frontend/dist 随子模块提供）
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # .gitmodules 用相对 URL（../ai-lubricant-*.git），在 fork 里会解析成
+      # winffychu/ai-lubricant-*.git（不存在）。子模块只在上游 wuxin-gh，这里改写前缀后初始化。
+      - name: 检出子模块（改写到上游 wuxin-gh，user-frontend/dist 随子模块提供）
+        run: |
+          git config --global url."https://github.com/wuxin-gh/".insteadOf "https://github.com/winffychu/"
+          git submodule update --init --recursive --depth 1
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@v3

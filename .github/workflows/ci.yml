@@ -77,10 +77,16 @@ jobs:
       REDIS_DECODE_RESPONSES: "true"
 
     steps:
-      - name: Checkout（含子模块）
+      - name: Checkout
         uses: actions/checkout@v4
-        with:
-          submodules: recursive
+
+      # .gitmodules 用相对 URL（../ai-lubricant-*.git）。在 fork 里会解析成
+      # winffychu/ai-lubricant-*.git（不存在）；子模块只存在于上游 wuxin-gh。
+      # 这里把 winffychu/ 前缀改写到 wuxin-gh/ 再初始化（上游运行时为无副作用的空操作）。
+      - name: 检出子模块（改写到上游 wuxin-gh 公共仓库）
+        run: |
+          git config --global url."https://github.com/wuxin-gh/".insteadOf "https://github.com/winffychu/"
+          git submodule update --init --recursive --depth 1
 
       - name: Set up Python 3.11（对齐 Dockerfile）
         uses: actions/setup-python@v5
