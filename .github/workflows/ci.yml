@@ -105,7 +105,8 @@ jobs:
       #   - 用 `python -m pytest`（而非 pytest 脚本）以把仓库根加入 sys.path——部分用例
       #     直接 `import providers`（根目录包），且 server/admin.py 也依赖它。
       #   - 测试套件含 PEP 701 语法（f-string 内反斜杠，如 test_upstream_stream.py），
-      #     需 Python >= 3.12 才能解析；运行时镜像仍为 3.11，本流水线只做测试校验。
+      #     需 Python >= 3.12 才能解析。运行时镜像（Dockerfile / Dockerfile.codespace）
+      #     已统一为 python:3.12-slim，故 CI 与发布镜像版本一致。
       #   - 公开快照并非全绿：部分用例与当前源码不一致，或依赖未随快照发布的资源
       #     （specs/、static/admin.html 等）。这些属于快照既有问题、与本次 CI 无关，
       #     以 .github/pytest-known-failures.txt 显式 deselect，保证「可跑子集」全绿。

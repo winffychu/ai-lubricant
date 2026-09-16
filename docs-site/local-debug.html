@@ -42,7 +42,7 @@
 <h2 id="prereq">1. 环境准备</h2>
 <div class="note"><strong>还没有代码？</strong>先完成部署文档的<a href="deploy.html#clone">「拉取代码与子模块」</a>一步——五个子模块必须显式拉取，否则前端和节点二进制都不在。</div>
 <ul>
-  <li>Python 3.11（推荐 venv）+ <code>requirements.txt</code> 依赖。这一份依赖同时覆盖三个 Python 进程，不需要分别装。</li>
+  <li>Python 3.12（推荐 venv）+ <code>requirements.txt</code> 依赖。这一份依赖同时覆盖三个 Python 进程，不需要分别装。</li>
   <li>PostgreSQL 与 Redis（本机、Docker 或远程均可）。Redis <strong>必须 ≥ 6.0</strong>：客户端强制 <code>HELLO 3</code> 握手，早期版本没有这个命令。</li>
   <li>前端：Node.js 18+ 与 <strong>pnpm</strong>（仓库锁文件是 <code>pnpm-lock.yaml</code>）。</li>
   <li>（可选）Go 工具链用于重新构建节点二进制；调试后端通常不需要。</li>

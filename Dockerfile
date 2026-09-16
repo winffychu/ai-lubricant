@@ -3,7 +3,7 @@
 # Docker Hub 基础镜像前缀，供国内部署走加速器（compose 经 build.args 注入，
 # 取值来自 MIRROR_MODE=cn 的 DOCKER_REGISTRY_PREFIX）。默认空 = 直连 Docker Hub。
 ARG DOCKER_REGISTRY_PREFIX=
-FROM ${DOCKER_REGISTRY_PREFIX}python:3.11-slim
+FROM ${DOCKER_REGISTRY_PREFIX}python:3.12-slim
 
 WORKDIR /app
 

@@ -99,7 +99,7 @@ docker compose exec -T postgres pg_dump -U ai_lubricant -d ai-lubricant -Fc > ai
 
 ### 本地运行
 
-需要 Python 3.11、PostgreSQL 16+ 和 Redis 6+：
+需要 Python 3.12、PostgreSQL 16+ 和 Redis 6+：
 
 ```bash
 cp .env.example .env
