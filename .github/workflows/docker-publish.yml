@@ -1,0 +1,89 @@
+# 构建 Ai Lubricant 数据服务镜像并发布到 GitHub Container Registry (GHCR)。
+#
+# 该镜像内含三个入口（main / node_server / tunnel_server），与 docker-compose.yml
+# 中的 `ai-lubricant:<TAG>` 完全一致——compose 里由 ai-lubricant 服务 build 一次，
+# node-server / tunnel-server 仅引用同一 tag 并按服务分配 command。因此这里只需
+# 构建根目录 Dockerfile 一个镜像即可覆盖三种进程。
+#
+# 触发：
+#   - push 到 main         → 发布 main 标签 + latest
+#   - push tag v*          → 发布该 tag 标签 + latest
+#   - pull_request 到 main → 仅构建校验，不推送
+#   - workflow_dispatch    → 手动触发
+#
+# 前置：仓库 Settings → Actions → General → Workflow permissions 需允许读写
+#   （packages: write）。默认的 GITHUB_TOKEN 已足够推送到本仓库的 GHCR，无需额外密钥。
+#
+# 说明：构建上下文已由 .dockerignore 收敛，仅保留运行时业务文件（node_server/ 与
+#   user-frontend/ 随镜像，user-frontend/dist 由子模块提供，故 checkout 必须带子模块）。
+#   构建参数：PIP_INDEX_URL 指向 PyPI（Dockerfile 默认清华源，仅适合国内构建）；
+#   DOCKER_REGISTRY_PREFIX 留空 = 直连 Docker Hub（国内构建可改为加速器前缀）。
+
+name: Build & Publish Docker Image
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - name: Checkout（含子模块，user-frontend/dist 随子模块提供）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up QEMU（多架构构建）
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR（PR 不登录）
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成镜像标签与 OCI 元数据
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=tag
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=sha,format=short
+            type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/') }}
+
+      - name: 构建并推送镜像
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # 同时产出 amd64 / arm64，单 tag 多架构清单。
+          platforms: linux/amd64,linux/arm64
+          push: ${{ github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            PIP_INDEX_URL=https://pypi.org/simple
+            DOCKER_REGISTRY_PREFIX=
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

@@ -1,0 +1,164 @@
+# 验收冒烟流水线：构建发布镜像 → 起 PG/Redis → 跑主服务 → 轮询健康接口。
+#
+# 触发：
+#   - push 到 main
+#   - pull_request 到 main
+#   - workflow_dispatch 手动触发
+#
+# 目标：在 GitHub Actions 上完成一次「可运行的验收」——
+#   1. 用根 Dockerfile 构建 ai-lubricant 镜像（单架构 amd64，load 进本地 daemon）；
+#   2. 起 postgres:16-alpine / redis:7-alpine，与主容器同处一个自定义网络；
+#   3. 用与 docker-compose.yml 一致的端口（宿主 3006 → 容器 8001）与环境变量
+#      运行主服务（python main.py）；
+#   4. 轮询 http://localhost:3006/mcp/health 直到 200，并校验 /v1/models 可访问，
+#      作为冒烟验收。失败时导出容器日志便于定位。
+#
+# 注意：本流水线只做「进程能起、HTTP 能答」的冒烟验收；真实上游渠道连通性、
+# 节点/移动端/设备控制子模块集成、需真实密钥或公网环境的验收项无法在此覆盖，
+# 需人工复核（见 deliverables/fork-ci-report.md）。
+
+name: Acceptance Smoke Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: acceptance-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    name: build image & smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout（含子模块，user-frontend/dist 随子模块提供）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 构建镜像（amd64，加载到本地 daemon）
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          load: true
+          tags: ai-lubricant:ci
+          build-args: |
+            PIP_INDEX_URL=https://pypi.org/simple
+            DOCKER_REGISTRY_PREFIX=
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 生成 .env（对齐 .env.example，填充必填密钥与内网服务名）
+        run: |
+          python - <<'PY'
+          import pathlib, secrets
+          src = pathlib.Path(".env.example")
+          text = src.read_text(encoding="utf-8")
+          # 容器内通过自定义网络的容器名访问依赖服务。
+          text = text.replace("POSTGRES_HOST=127.0.0.1", "POSTGRES_HOST=postgres")
+          text = text.replace("REDIS_HOST=127.0.0.1", "REDIS_HOST=redis")
+          # 三个共享密钥必须非空（留空会触发容器内自动写回 .env）。
+          text = text.replace(
+              "NODE_CONTROL_TOKEN=",
+              "NODE_CONTROL_TOKEN=" + secrets.token_urlsafe(32),
+          )
+          text = text.replace(
+              "NODE_CREDENTIAL_ENCRYPTION_KEY=",
+              "NODE_CREDENTIAL_ENCRYPTION_KEY=" + secrets.token_hex(32),
+          )
+          text = text.replace(
+              "AGENT_ATTACHMENT_SIGNING_KEY=",
+              "AGENT_ATTACHMENT_SIGNING_KEY=" + secrets.token_urlsafe(48),
+          )
+          pathlib.Path(".env").write_text(text, encoding="utf-8")
+          print("wrote .env")
+          PY
+
+      - name: 起 PG / Redis（自定义网络，容器名对齐 compose 服务名）
+        run: |
+          docker network create ai-lubricant-ci
+          docker run -d --name postgres --network ai-lubricant-ci \
+            -e POSTGRES_USER=ai_lubricant \
+            -e POSTGRES_PASSWORD=ai_lubricant \
+            -e POSTGRES_DB=ai-lubricant \
+            -e TZ=Asia/Shanghai \
+            postgres:16-alpine
+          docker run -d --name redis --network ai-lubricant-ci \
+            redis:7-alpine redis-server --maxmemory-policy noeviction --appendonly yes
+
+      - name: 等待 PG / Redis 就绪
+        run: |
+          set -e
+          for i in $(seq 1 60); do
+            if docker exec postgres pg_isready -U ai_lubricant -d ai-lubricant >/dev/null 2>&1; then
+              echo "postgres ready"; break
+            fi
+            echo "waiting postgres ($i)"; sleep 2
+          done
+          for i in $(seq 1 60); do
+            if [ "$(docker exec redis redis-cli ping 2>/dev/null)" = "PONG" ]; then
+              echo "redis ready"; break
+            fi
+            echo "waiting redis ($i)"; sleep 2
+          done
+          docker exec postgres pg_isready -U ai_lubricant -d ai-lubricant
+          docker exec redis redis-cli ping
+
+      - name: 运行主服务容器（宿主 3006 → 容器 8001）
+        run: |
+          docker run -d --name ai-lubricant --network ai-lubricant-ci \
+            --env-file .env \
+            -e POSTGRES_HOST=postgres \
+            -e REDIS_HOST=redis \
+            -e SERVER_PORT=8001 \
+            -e DEBUG=false \
+            -p 3006:8001 \
+            ai-lubricant:ci
+
+      - name: 冒烟验收（轮询 /mcp/health，校验 /v1/models）
+        run: |
+          set -e
+          ok=0
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3006/mcp/health || true)
+            echo "attempt $i: /mcp/health -> $code"
+            if [ "$code" = "200" ]; then ok=1; break; fi
+            # 容器若已退出则立即失败，避免空等。
+            if [ "$(docker inspect -f '{{.State.Running}}' ai-lubricant 2>/dev/null)" != "true" ]; then
+              echo "container exited early"; break
+            fi
+            sleep 5
+          done
+          if [ "$ok" != "1" ]; then
+            echo "::error::/mcp/health 未在预期时间内返回 200"
+            exit 1
+          fi
+          echo "health OK:"; curl -fsS http://localhost:3006/mcp/health; echo
+          curl -fsS -o /dev/null -w 'GET /v1/models -> %{http_code}\n' http://localhost:3006/v1/models
+
+      - name: 失败时导出容器日志
+        if: failure()
+        run: |
+          echo "===== ai-lubricant (main) ====="; docker logs ai-lubricant --tail 300 || true
+          echo "===== postgres ====="; docker logs postgres --tail 80 || true
+          echo "===== redis ====="; docker logs redis --tail 80 || true
+
+      - name: 清理
+        if: always()
+        run: |
+          docker rm -f ai-lubricant postgres redis >/dev/null 2>&1 || true
+          docker network rm ai-lubricant-ci >/dev/null 2>&1 || true

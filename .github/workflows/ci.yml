@@ -1,0 +1,99 @@
+# 单元 / 集成测试流水线（pytest）。
+#
+# 触发：
+#   - push 到 main
+#   - pull_request 到 main
+#   - workflow_dispatch 手动触发
+#
+# 说明：
+#   - 测试位于仓库根 tests/，pytest.ini 已声明 testpaths=tests、pythonpath=server。
+#   - 绝大多数用例通过 monkeypatch/AsyncMock 打桩，不依赖真实外部服务；但为覆盖
+#     「真的连库」的少量用例，这里用 GitHub Actions services 起 postgres:16 / redis:7，
+#     连接参数对齐 .env.example（POSTGRES_HOST/POSTGRES_PORT/... 、REDIS_HOST/...）。
+#   - 依赖按仓库根 requirements.txt 安装；测试框架额外安装 pytest / pytest-asyncio
+#     （用例大量使用 @pytest.mark.asyncio）/ pytest-timeout（防止个别用例挂死）。
+#   - 必须 checkout 子模块：部分用例（node_server / tunnel_server 相关）会 import
+#     子模块代码，pythonpath 之外的平铺 import 也依赖子模块目录存在。
+
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支上的新推送取消尚未完成的旧运行，节省额度。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  pytest:
+    name: pytest
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ai_lubricant
+          POSTGRES_PASSWORD: ai_lubricant
+          POSTGRES_DB: ai-lubricant
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U ai_lubricant -d ai-lubricant"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      # 与 .env.example / docker-compose.yml 对齐的连接参数。
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ai_lubricant
+      POSTGRES_PASSWORD: ai_lubricant
+      POSTGRES_DATABASE: ai-lubricant
+      POSTGRES_POOL_MIN_SIZE: "1"
+      POSTGRES_POOL_MAX_SIZE: "10"
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+      REDIS_DB: "0"
+      REDIS_DECODE_RESPONSES: "true"
+
+    steps:
+      - name: Checkout（含子模块）
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up Python 3.11（对齐 Dockerfile）
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: 安装依赖
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest pytest-asyncio pytest-timeout
+
+      - name: 运行 pytest
+        run: |
+          pytest -q --timeout=300 --timeout-method=thread
