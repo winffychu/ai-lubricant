@@ -96,7 +96,7 @@ jobs:
             ai-lubricant-codespace:ci
           # 等 supervisord 把 PG/Redis/main 拉起来；main 自己绑 7860。
           ok=0
-          for i in $(seq 1 120); do
+          for i in $(seq 1 60); do
             code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7860/mcp/health || true)
             root=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:7860/ || true)
             echo "attempt $i: /mcp/health -> ${code} ; / -> ${root}"
@@ -106,8 +106,18 @@ jobs:
             fi
             sleep 5
           done
-          echo "===== container logs (tail 200) ====="
-          docker logs ai-lubricant-codespace --tail 200 || true
+          echo "===== supervisord stdout (tail 60) ====="
+          docker logs ai-lubricant-codespace --tail 60 || true
+          echo "===== supervisorctl status ====="
+          docker exec ai-lubricant-codespace supervisorctl \
+            -c /opt/ailubricant/runtime/config/supervisord-native.conf status 2>&1 || true
+          echo "===== per-program logs (tail) ====="
+          docker exec ai-lubricant-codespace sh -lc '
+            for f in /opt/ailubricant/runtime/logs/*.log; do
+              echo "----- ${f} -----"; tail -n 80 "${f}" 2>/dev/null || true;
+            done' 2>&1 || true
+          echo "===== listening sockets ====="
+          docker exec ai-lubricant-codespace sh -lc 'ss -ltnp 2>/dev/null || netstat -ltnp 2>/dev/null || true' 2>&1 || true
           if [ "${ok}" != "1" ]; then
             echo "::warning::codespace 冒烟未在预期时间内就绪（非阻断；build 已成功）"
             exit 1
