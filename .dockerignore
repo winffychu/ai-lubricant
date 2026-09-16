@@ -23,6 +23,7 @@ build/AiLubricant/
 
 # 本地工具目录（不进镜像）
 .venv/
+.venv-ci/
 .worktrees/
 .pytest_cache/
 .codegraph/

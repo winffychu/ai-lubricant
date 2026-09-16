@@ -80,6 +80,7 @@ scripts/
 data/
 # 本地虚拟环境与 Cloudflare Pages 本地状态（可重建，不入库）
 .venv/
+.venv-ci/
 .wrangler/
 .claude_ch9.md
 .claude_chapter4.md
