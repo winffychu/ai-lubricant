@@ -70,11 +70,13 @@ skills-lock.json
 # probe_apple_gsa.sh 是 Apple ID 登录出口的诊断脚本（多机部署用），例外入库
 # native_launch.sh 是无 Docker 原生启动入口（见 native_deps/），例外入库
 # init_compose_env.py 在 docker compose 首次启动前生成跨容器共享密钥，例外入库
+# upgrade_compose.sh 是 compose 升级入口（pull/retag/--force-recreate/版本核验），例外入库
 script/*
 !script/publish_github.sh
 !script/probe_apple_gsa.sh
 !script/native_launch.sh
 !script/init_compose_env.py
+!script/upgrade_compose.sh
 scripts/
 # data/ 全部为本地使用的数据（运行时记忆/技能归档/内置 SOP/市场转换缓存），不入库不上传
 data/

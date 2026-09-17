@@ -9,7 +9,17 @@
 #   - push 到 main         → 发布 main 标签 + latest
 #   - push tag v*          → 发布该 tag 标签 + latest
 #   - pull_request 到 main → 仅构建校验，不推送
-#   - workflow_dispatch    → 手动触发
+#   - workflow_dispatch    → 手动触发（可填 version 指定版本号，留空则自动推导）
+#
+# 版本可核验：镜像内置 AI_LUBRICANT_VERSION（Dockerfile 末尾的 ENV），
+#   tag 推送 = 该 tag，人工 input = 该 input，分支推送 = main-<7hex>。
+#   核验：docker exec <容器> printenv AI_LUBRICANT_VERSION
+#   权威发布路径是 .github/workflows/sync-upstream.yml（生成 vYYMMDD.N tag 后
+#   `gh workflow run docker-publish.yml --ref <tag>`），见 docs/DOCKER_IMAGE.md。
+#
+# 注：vYYMMDD.N 只有两段，不是合法 semver，故 metadata-action 不配 type=semver
+#   （配了也永不命中，反而误导）。tag 规则里那条 type=raw 只在人工填了
+#   workflow_dispatch 的 version input 时才启用。
 #
 # 前置：仓库 Settings → Actions → General → Workflow permissions 需允许读写
 #   （packages: write）。默认的 GITHUB_TOKEN 已足够推送到本仓库的 GHCR，无需额外密钥。
@@ -28,6 +38,12 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      version:
+        description: "可选：人工发布的版本号（如 v260917.1）。留空 = 按触发方式自动推导（tag 推送用 tag，分支推送用 main-<7hex>）"
+        required: false
+        default: ""
+        type: string
 
 env:
   REGISTRY: ghcr.io
@@ -72,10 +88,28 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=tag
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
             type=sha,format=short
+            type=raw,value=${{ inputs.version }},enable=${{ inputs.version != '' }}
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/') }}
+
+      # 可核验版本号：tag 推送 → 该 tag；人工填了 input → 该 input；其余（分支推送）
+      # → main-<7hex>。注入镜像的 AI_LUBRICANT_VERSION（见 Dockerfile 末尾），
+      # 运维用 `docker exec <容器> printenv AI_LUBRICANT_VERSION` 即可核验。
+      # 注：vYYMMDD.N 不是合法 semver，故不配置 type=semver 规则（永不命中）。
+      - name: 解析可核验版本号
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if [ -n "${INPUT_VERSION}" ]; then
+            v="${INPUT_VERSION}"
+          elif [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            v="${GITHUB_REF_NAME}"
+          else
+            v="main-${GITHUB_SHA::7}"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          echo "AI_LUBRICANT_VERSION=${v}"
 
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
@@ -90,5 +124,6 @@ jobs:
           build-args: |
             PIP_INDEX_URL=https://pypi.org/simple
             DOCKER_REGISTRY_PREFIX=
+            APP_VERSION=${{ steps.ver.outputs.version }}
           cache-from: type=gha
           cache-to: type=gha,mode=max

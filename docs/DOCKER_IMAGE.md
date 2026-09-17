@@ -32,7 +32,22 @@
 | push 到 `main` | 构建并推送 `main` 标签 + `latest` |
 | push tag `v*` | 构建并推送该 tag 标签 + `latest` |
 | pull_request 到 `main` | 仅构建校验，**不推送** |
-| workflow_dispatch | 手动触发 |
+| workflow_dispatch | 手动触发；可填 `version` input 指定版本号（留空则自动推导） |
+
+**版本 tag 由谁生成**：权威发布路径是 `.github/workflows/sync-upstream.yml`（每周同步上游 →
+`ci.yml` 通过 → 在 GitHub 侧生成单调递增的 `vYYMMDD.N` tag → 用该 tag 触发本工作流）。
+人工发布可以推一个 `vYYMMDD.N` tag，也可以在 Actions 页面用 `workflow_dispatch` 填 `version`。
+
+**镜像内的版本标识**：镜像内置 `AI_LUBRICANT_VERSION`（由 `APP_VERSION` build-arg 写入）：
+
+| 触发方式 | `AI_LUBRICANT_VERSION` | `org.opencontainers.image.version` |
+|---|---|---|
+| tag 驱动发布（权威路径） | 版本 tag，如 `v260917.1` | 同左 |
+| `workflow_dispatch` 填了 `version` | 该输入值 | 该输入值 |
+| 分支推送（开发构建） | `main-<7hex>` | `main`（metadata-action 固有行为） |
+
+> 分支推送时 OCI label 仍是 `main`，**请一律用 `AI_LUBRICANT_VERSION` 核验实际版本**：
+> `docker exec ai-lubricant printenv AI_LUBRICANT_VERSION`。
 
 产出的镜像地址：
 
@@ -40,7 +55,7 @@
 ghcr.io/<owner>/ai-lubricant:<tag>
 ```
 
-例如 `ghcr.io/wuxin-gh/ai-lubricant:latest`、`ghcr.io/wuxin-gh/ai-lubricant:v260916`。
+例如 `ghcr.io/wuxin-gh/ai-lubricant:latest`、`ghcr.io/wuxin-gh/ai-lubricant:v260917.1`。
 
 ### 关键点
 
@@ -76,14 +91,20 @@ GHCR 包默认继承仓库可见性。若要让他人免登录拉取，在仓库
 
 ```bash
 # 先拉取发布镜像
-docker pull ghcr.io/wuxin-gh/ai-lubricant:latest
-docker tag  ghcr.io/wuxin-gh/ai-lubricant:latest ai-lubricant:local
+docker pull ghcr.io/wuxin-gh/ai-lubricant:v260917.1
+docker tag  ghcr.io/wuxin-gh/ai-lubricant:v260917.1 ai-lubricant:local
 # compose 中 TAG=local 时，三个服务都会复用这个本地 tag
-docker compose up -d
+docker compose up -d --force-recreate
 ```
 
 > 说明：`x-app-image` 锚点把共享 tag 固定为 `ai-lubricant:${TAG:-local}`。把发布镜像
 > 重新 tag 成 `ai-lubricant:local` 即可让 compose 直接复用，无需改编排。
+>
+> ⚠ **`docker compose up -d` 单独用不会重建容器**：compose 判断是否重建看的是服务配置
+> 哈希（镜像引用串、env、volumes…），**不比对本地镜像 ID**。`docker tag` 只改了
+> `ai-lubricant:local` 这个名字背后的镜像 ID，配置哈希不变 → 容器不会重建，跑的还是
+> 旧镜像。**升级必须加 `--force-recreate`**，完整流程见
+> [DEPLOY.md 的「升级」章节](DEPLOY.md#升级已部署实例换新版本)。
 
 ### 方式 2：直接运行单进程（不用 compose）
 
@@ -126,3 +147,8 @@ env:
 > 提示：`script/publish_github.sh` 是**内网源码快照发布脚本**（推内网 Gitea + 造
 > GitHub 公开快照），与 Docker 镜像发布无关，其中含开发者本机代理等非业务内容，
 > 且 `script/` 已被 `.dockerignore` 排除、不会进入镜像。
+>
+> ⚠ **该脚本已非权威发布入口**。镜像的权威发布路径是 GitHub Actions
+> （`sync-upstream.yml` → `ci.yml` → `docker-publish.yml`，见本文第二节），
+> 版本 tag 由同步工作流生成；`publish_github.sh` 仅用于内网 → GitHub 公开快照的
+> 内部/遗留流程，不参与权威发布链路。

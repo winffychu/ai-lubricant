@@ -144,7 +144,7 @@ supervisord -c <生成的 conf 路径> -n
 |------|------|
 | `NATIVE_POSTGRES_VERSION` / `NATIVE_REDIS_VERSION` / `NATIVE_CLICKHOUSE_VERSION` | 锁定版本 |
 | `NATIVE_<PG\|REDIS\|CLICKHOUSE>_DOWNLOAD_URL` + `NATIVE_<...>_SHA256` | 覆盖下载源（内网镜像/自建）；必须同时给 SHA256，拒绝无校验下载 |
-| `NATIVE_DEPS_PROXY` | 下载走 HTTP 代理（如 `http://127.0.0.1:7890`） |
+| `NATIVE_DEPS_PROXY` | 下载走 HTTP 代理（如 `http://<proxy-host>:<port>`） |
 | `NATIVE_DEPS_ROOT` | 二进制/数据/配置根目录 |
 | `CLICKHOUSE_REQUEST_PAYLOAD_ENABLED` | `true` 才下载并拉起 ClickHouse（默认不拉，省 200MB+） |
 
@@ -220,3 +220,67 @@ curl http://localhost:8001/v1/models
 ```
 
 数据服务有响应即说明 PG/Redis 连通、主链路就绪；控制服务端口监听即说明 h2c 服务已起。
+
+## 升级（已部署实例换新版本）
+
+> **为什么必须按本节做**：`docker compose up -d` **不会**重建容器。compose 判断是否重建
+> 看的是服务**配置哈希**（镜像引用串、env、volumes、ports…），**不比对本地镜像 ID**。
+> `docker tag` 只改变了 `ai-lubricant:local` 这个名字背后的镜像 ID，配置哈希没变
+> → 容器不重建 → **跑的还是旧镜像**（表现为"重新构建后发布的还是旧版本"）。
+> 因此升级必须显式加 `--force-recreate`。
+
+### 版本号从哪来
+
+镜像的权威发布路径是 GitHub Actions：
+
+```
+.github/workflows/sync-upstream.yml   每周同步上游；ci.yml 通过后在 GitHub 侧生成
+                                      vYYMMDD.N（如 v260917.1、v260917.2，当日序号递增）
+        ↓ push tag
+.github/workflows/docker-publish.yml  用该 tag 构建并推送镜像
+```
+
+- **版本 tag `vYYMMDD.N` 由 `sync-upstream.yml` 生成**，人工也可以直接推一个 `vYYMMDD.N`
+  tag，或在 Actions 页面用 `workflow_dispatch` 填 `version`。
+- 镜像内置 `AI_LUBRICANT_VERSION`，**这是核验"当前跑的是哪个版本"的唯一可靠手段**：
+  tag 驱动发布时等于版本 tag，分支推送（开发构建）时为 `main-<7hex>`。
+- 关于 fork 同步的三个事实（避免重复探索）：GitHub **没有**任何内置的"定时自动同步 fork"
+  能力（仓库页只有手动 Sync fork 按钮）；`POST /repos/{owner}/{repo}/merge-upstream`
+  **只支持快进**；本 fork 已分叉（比上游多出若干提交），因此该 API 与 Sync fork 按钮
+  **当前都不可用**。每周同步由 `sync-upstream.yml` 用 `git merge --no-ff` 完成。
+
+### 步骤
+
+```bash
+# 0. 选定目标版本（见上一节；也可用 gh run list 查看最近一次发布）
+VERSION=v260917.1
+
+# 1. 拉取目标版本镜像
+docker pull ghcr.io/<owner>/ai-lubricant:$VERSION
+
+# 2. 重新打成本地共享 tag（compose 的 ai-lubricant:${TAG:-local} 认这个名字）
+docker tag ghcr.io/<owner>/ai-lubricant:$VERSION ai-lubricant:local
+
+# 3. 强制重建容器（关键：不加 --force-recreate 容器不会重建）
+docker compose up -d --force-recreate
+
+# 4. 核验：容器内版本必须等于 $VERSION
+docker exec ai-lubricant printenv AI_LUBRICANT_VERSION
+```
+
+**第 4 步不等于 `$VERSION` 即视为升级失败**，回滚：
+
+```bash
+docker tag ghcr.io/<owner>/ai-lubricant:<上一个版本> ai-lubricant:local
+docker compose up -d --force-recreate
+```
+
+> 也可以直接用 `bash script/upgrade_compose.sh <VERSION>` 一步完成上面 4 步
+> （脚本只做 pull / tag / up --force-recreate / 版本核验，**不含任何 `docker build`**；
+> 核验不一致会退出非 0 并打印回滚命令）。
+
+### 反向验证（证明 `--force-recreate` 是必需的）
+
+在同一台机器上：旧版本在跑时，**跳过 `--force-recreate` 只执行 `docker compose up -d`**
+→ `docker exec ai-lubricant printenv AI_LUBRICANT_VERSION` **不变**（仍是旧版本）。
+这一步说明"镜像换了但容器没重建"，也是排查"还是旧版本"类问题的第一现场。

@@ -27,3 +27,12 @@ EXPOSE 8001 8003 8004
 
 # 启动命令
 CMD ["python", "main.py"]
+
+# 可核验版本标识：由 docker-publish.yml 的 APP_VERSION build-arg 注入。
+#   tag 驱动发布（权威路径）→ 版本 tag，如 v260917.1
+#   人工发布填了 version input → 该值
+#   分支推送（开发构建）    → main-<7hex>
+# 运维核验：docker exec <容器> printenv AI_LUBRICANT_VERSION
+# 放在文件末尾是刻意的：版本号每次发布都会变，放前面会击穿所有层缓存。
+ARG APP_VERSION=dev
+ENV AI_LUBRICANT_VERSION=${APP_VERSION}
