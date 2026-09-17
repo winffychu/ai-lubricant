@@ -13,7 +13,7 @@
 #                 → dispatch docker-publish.yml --ref <tag>
 #   都不满足 → 空跑退出（不产 tag、不发布）
 #
-# 三个硬坑与对策：
+# 四个硬坑与对策：
 #   1. GITHUB_TOKEN 的 push 不触发其它工作流（官方防递归）→ 用 `gh workflow run`
 #      显式 dispatch（workflow_dispatch 对防递归有官方豁免，无需 PAT）。
 #   2. fork 已分叉，merge-upstream 必然 422 → 用 `git merge --no-ff`（不 rewrite 历史、
@@ -21,6 +21,11 @@
 #   3. .gitmodules 是相对 URL，在 fork 里会解析成不存在的 winffychu/ai-lubricant-*.git
 #      → 全程不初始化、不克隆子模块（submodules: false + 不做 submodule update）；
 #      gitlink 由索引层随主仓 tree 一起推走，发布链路（docker-publish.yml）自己处理。
+#   4. 第 2 步加的 upstream remote 会**劫持 gh CLI 的仓库解析** —— gh 从 remote 列表里
+#      挑仓库，于是所有 gh 调用（workflow run / run list / run watch / issue）都打向
+#      wuxin-gh/ai-lubricant（上游）。上游没有 ci.yml → 404 → set -e 直接终结 job，
+#      tag 与发布永远不会发生。对策：job 级 GH_REPO 把仓库钉死在 fork 上，且每个能接
+#      受 --repo 的调用都显式带上 --repo "${GITHUB_REPOSITORY}" 作双保险。
 #
 # 发布门槛：**仅 ci.yml 通过即发布**（acceptance.yml / codespace.yml 各 60 分钟，
 #   不纳入自动门槛，由人按需手动跑）。
@@ -55,6 +60,11 @@ jobs:
     timeout-minutes: 120
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      # 第 2 步加的 upstream remote 会劫持 gh 的仓库解析（gh 会去问 wuxin-gh/ai-lubricant），
+      # 导致 workflow run / run list / run watch / issue 全部打向上游 —— 上游没有 ci.yml，
+      # 直接 404 终结 job，tag 与发布永远不会发生。GH_REPO 把仓库钉死在 fork 上，
+      # 不受 remote 列表影响。
+      GH_REPO: ${{ github.repository }}
     steps:
       # 只取主仓；子模块全程不碰（见文件头硬坑 3）。fetch-depth: 0 因为 merge 需要完整历史。
       - name: Checkout（不初始化子模块）
@@ -95,13 +105,15 @@ jobs:
           git merge --abort || true
           body="$(printf '上游同步合并出现冲突，需人工处理（本工作流不会发布，避免半成品上线）。\n\n- 上游仓库: %s\n- 上游 sha: %s\n- 本工作流运行: %s/%s/actions/runs/%s\n\n冲突文件（最多 50 个）:\n%s\n\n处理方式：本地 `git fetch upstream main && git merge --no-ff upstream/main` 解决冲突后推 main，再手动触发本工作流（Phase 2 判据会继续走 CI + 发布）。\n' \
             "${UPSTREAM_REPO}" "${UPSTREAM_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}" "${conflict_files}")"
-          issue_no="$(gh issue list --state open --search '上游同步冲突 in:title' \
+          issue_no="$(gh issue list --repo "${GITHUB_REPOSITORY}" \
+              --state open --search '上游同步冲突 in:title' \
               --json number --jq '.[0].number // empty' || true)"
           if [ -n "${issue_no}" ]; then
-            gh issue comment "${issue_no}" --body "${body}"
+            gh issue comment "${issue_no}" --repo "${GITHUB_REPOSITORY}" --body "${body}"
             echo "已在 issue #${issue_no} 追加冲突信息"
           else
-            gh issue create --title "上游同步冲突（需人工处理）" --body "${body}"
+            gh issue create --repo "${GITHUB_REPOSITORY}" \
+              --title "上游同步冲突（需人工处理）" --body "${body}"
             echo "已创建冲突 issue"
           fi
           echo "✗ 合并冲突，未发布任何内容" >&2
@@ -153,11 +165,12 @@ jobs:
           set -euo pipefail
           sync_sha="$(git rev-parse HEAD)"
           echo "目标提交（本次 ci.yml 应测的 sha）: ${sync_sha}"
-          gh workflow run ci.yml --ref main
+          gh workflow run ci.yml --ref main --repo "${GITHUB_REPOSITORY}"
           run_id=""
           for attempt in $(seq 1 12); do
             sleep 10
             run_id="$(gh run list --workflow=ci.yml --branch=main --limit 20 \
+                --repo "${GITHUB_REPOSITORY}" \
                 --json databaseId,headSha \
                 --jq ".[] | select(.headSha==\"${sync_sha}\") | .databaseId" | head -1 || true)"
             if [ -n "${run_id}" ]; then break; fi
@@ -169,7 +182,7 @@ jobs:
           fi
           echo "CI_RUN_ID=${run_id}" >> "$GITHUB_ENV"
           echo "ci.yml run id=${run_id}（headSha=${sync_sha}）"
-          gh run watch "${run_id}" --exit-status
+          gh run watch "${run_id}" --exit-status --repo "${GITHUB_REPOSITORY}"
           echo "ci.yml 通过"
 
       # ── 生成单调版本 tag（GitHub 侧）──────────────────────────────────────
@@ -224,11 +237,12 @@ jobs:
           # 与 GitHub 的时钟同步，也不用假设 createdAt 的字符串格式可比。取不到时退化为 0
           # （否则下面的 jq 数值比较会炸）。
           max_before="$(gh run list --workflow=docker-publish.yml --limit 1 \
+              --repo "${GITHUB_REPOSITORY}" \
               --json databaseId --jq '.[0].databaseId // 0' || echo 0)"
           case "${max_before}" in ''|*[!0-9]*) max_before=0;; esac
           echo "dispatch 前的最大 docker-publish.yml run id = ${max_before}"
 
-          gh workflow run docker-publish.yml --ref "${TAG}"
+          gh workflow run docker-publish.yml --ref "${TAG}" --repo "${GITHUB_REPOSITORY}"
 
           rollback() {
             echo "✗ $1" >&2
@@ -256,6 +270,7 @@ jobs:
           for attempt in $(seq 1 12); do
             sleep 10
             run_id="$(gh run list --workflow=docker-publish.yml --limit 30 \
+                --repo "${GITHUB_REPOSITORY}" \
                 --json databaseId,event,headBranch \
                 --jq ".[] | select(.event==\"workflow_dispatch\") | select(.headBranch==\"${TAG}\") | select(.databaseId > ${max_before}) | .databaseId" \
                 | head -1 || true)"
@@ -282,7 +297,7 @@ jobs:
           # 用 `|| watch_rc=$?` 而不是 `if ! ...; then`：`if !` 的 then 分支里 $? 恒为 0，
           # 读不到真实退出码，也就分不清"构建失败"与"等待超时"。
           watch_rc=0
-          timeout 60m gh run watch "${run_id}" --exit-status || watch_rc=$?
+          timeout 60m gh run watch "${run_id}" --exit-status --repo "${GITHUB_REPOSITORY}" || watch_rc=$?
           if [ "${watch_rc}" -ne 0 ]; then
             if [ "${watch_rc}" -eq 124 ]; then
               rollback "docker-publish.yml run ${run_id} 等待超时（timeout 60m 到点，退出码 124）；该构建可能仍在跑并最终成功，下次运行会重建同名 tag 并重发"
