@@ -208,10 +208,26 @@ jobs:
       # 永久判 publish=false —— 这次上游同步的发布就永久丢失（上游长期停滞时尤其致命）。
       # 因此这里必须确认"本次 dispatch 真的产生了一个运行、且该运行成功"，否则回滚 tag。
       # 回滚是安全的、自愈的：tag 删掉后下次运行 max 归 0，会重新生成同一个 ${base}.1 并重发。
+      #
+      # 本 step 有两处"防自己"的约束，都是 T20 补的：
+      #  1) 定位运行必须按 dispatch 前的最大 run id 过滤 —— 回滚只删 tag、不删运行记录，
+      #     否则重试时会选中同名 tag 的历史失败运行而误回滚新 tag（并循环卡死）。
+      #  2) watch 必须自带 `timeout` 上限 —— 父 job 的 timeout-minutes 一旦到点会直接
+      #     杀掉 job，回滚就不会执行，R2 的原失败模式原样回来。
       - name: 触发 docker-publish.yml（--ref <tag>）并确认已受理
         if: steps.phase2.outputs.publish == 'true'
         run: |
           set -euo pipefail
+
+          # 记下本次 dispatch 之前已存在的最大 run id，作为"历史运行"的分界线。
+          # 为什么用 databaseId 而不是 createdAt 时间戳：run id 单调递增，既不依赖运行器
+          # 与 GitHub 的时钟同步，也不用假设 createdAt 的字符串格式可比。取不到时退化为 0
+          # （否则下面的 jq 数值比较会炸）。
+          max_before="$(gh run list --workflow=docker-publish.yml --limit 1 \
+              --json databaseId --jq '.[0].databaseId // 0' || echo 0)"
+          case "${max_before}" in ''|*[!0-9]*) max_before=0;; esac
+          echo "dispatch 前的最大 docker-publish.yml run id = ${max_before}"
+
           gh workflow run docker-publish.yml --ref "${TAG}"
 
           rollback() {
@@ -227,27 +243,52 @@ jobs:
             exit 1
           }
 
-          # 定位本次 dispatch 产生的运行：event=workflow_dispatch 且 headBranch=<tag>。
-          # 实测依据：`gh workflow run --ref v260917.1` 产生的运行，其 head_branch 就是
-          # 'v260917.1'（不是 main、也不是 null），所以这个组合能精确命中本次运行。
+          # 定位本次 dispatch 产生的运行，三个条件同时成立：
+          #   event=workflow_dispatch —— 排除 tag push 自身触发的那条（它是 event=push）；
+          #   headBranch=<tag>        —— 实测 `gh workflow run --ref v260917.1` 产生的运行
+          #                              head_branch 就是 'v260917.1'（不是 main、也不是 null）；
+          #   databaseId > max_before —— **关键**：排除同名 tag 的历史运行。回滚只删 tag 不删
+          #                              运行记录，所以"同日先回滚过一次、之后又重试"时 API 里
+          #                              仍留着老运行；不排除的话新运行一旦没在第一个 sleep 内
+          #                              出现，head -1 就会选中老运行 → watch 非 0 → 误回滚新 tag，
+          #                              且每次重试都选中同一条，永远发布不出去。
           run_id=""
           for attempt in $(seq 1 12); do
             sleep 10
             run_id="$(gh run list --workflow=docker-publish.yml --limit 30 \
                 --json databaseId,event,headBranch \
-                --jq ".[] | select(.event==\"workflow_dispatch\") | select(.headBranch==\"${TAG}\") | .databaseId" \
+                --jq ".[] | select(.event==\"workflow_dispatch\") | select(.headBranch==\"${TAG}\") | select(.databaseId > ${max_before}) | .databaseId" \
                 | head -1 || true)"
             if [ -n "${run_id}" ]; then break; fi
             echo "· 等待 ${TAG} 的 workflow_dispatch 运行出现在 API（第 ${attempt}/12 次）…"
           done
           if [ -z "${run_id}" ]; then
-            rollback "未能定位到 ${TAG} 的 docker-publish.yml 运行（dispatch 未被受理或出现太慢）"
+            rollback "未能定位到 ${TAG} 的 docker-publish.yml 运行（dispatch 未被受理，或只存在同名 tag 的历史运行）"
           fi
 
           echo "PUBLISH_RUN_ID=${run_id}" >> "$GITHUB_ENV"
           echo "docker-publish.yml run id=${run_id}（ref=${TAG}）"
-          if ! gh run watch "${run_id}" --exit-status; then
-            rollback "docker-publish.yml run ${run_id} 未成功（构建失败或超时）"
+
+          # watch 必须自带上限：docker-publish.yml 自身没有 timeout-minutes（默认 360 分钟），
+          # 而本 step 跑在父 job 的 timeout-minutes: 120 里 —— 父 job 一旦被 timeout 杀掉，
+          # 回滚不会执行，tag 留在 origin，Phase 2 从此恒判 publish=false。
+          # 余量：ci.yml 门禁最坏 45 分钟 + watch 上限 60 分钟 + 回滚开销 ≈ 110 < 120。
+          #
+          # 已知代价（不藏着）：watch 超时后回滚时，那次构建**可能仍在跑并最终成功**，
+          # 于是镜像里会留下一个 vYYMMDD.N 标签而 git tag 已被删；下次运行会重建同名 tag
+          # 并重发（同 tag、新 digest），最终一致。选"超时也回滚"是因为错误方向更安全：
+          # 漏回滚 = 发布永久丢失；多回滚 = 多推一次同 tag 镜像。
+          #
+          # 用 `|| watch_rc=$?` 而不是 `if ! ...; then`：`if !` 的 then 分支里 $? 恒为 0，
+          # 读不到真实退出码，也就分不清"构建失败"与"等待超时"。
+          watch_rc=0
+          timeout 60m gh run watch "${run_id}" --exit-status || watch_rc=$?
+          if [ "${watch_rc}" -ne 0 ]; then
+            if [ "${watch_rc}" -eq 124 ]; then
+              rollback "docker-publish.yml run ${run_id} 等待超时（timeout 60m 到点，退出码 124）；该构建可能仍在跑并最终成功，下次运行会重建同名 tag 并重发"
+            else
+              rollback "docker-publish.yml run ${run_id} 未成功（构建失败，gh 退出码 ${watch_rc}）"
+            fi
           fi
           echo "✓ 已发布 ${TAG}（run ${run_id}）"
 
