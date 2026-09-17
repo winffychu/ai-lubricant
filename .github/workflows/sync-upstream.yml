@@ -1,0 +1,228 @@
+# 每周自动同步上游 + 有更新即发布（第 5 条工作流，纯新增，不改动既有 4 条）。
+#
+# 为什么必须自己写：GitHub **没有**任何"定时自动同步 fork"的内置能力——
+#   * 仓库页只有手动 "Sync fork" 按钮（不能定时）；
+#   * POST /repos/{owner}/{repo}/merge-upstream 只支持快进，而本 fork 已分叉
+#     （fork main = 上游 + 若干提交）→ 该 API 与 Sync fork 按钮当前都不可用。
+# 因此每周同步只能由本工作流的 cron + git merge --no-ff 完成。
+#
+# 链路（两阶段幂等模型，详见 deliverables/hardening-design.md §4.2.3 / §5）：
+#   Phase 1 同步：upstream/main 不是 HEAD 的祖先 → merge --no-ff → push origin main
+#   Phase 2 发布：存在"上游同步合并提交"且它未被任何 v* tag 覆盖
+#                 → dispatch+wait ci.yml → 通过后生成 vYYMMDD.N tag → push tag
+#                 → dispatch docker-publish.yml --ref <tag>
+#   都不满足 → 空跑退出（不产 tag、不发布）
+#
+# 三个硬坑与对策：
+#   1. GITHUB_TOKEN 的 push 不触发其它工作流（官方防递归）→ 用 `gh workflow run`
+#      显式 dispatch（workflow_dispatch 对防递归有官方豁免，无需 PAT）。
+#   2. fork 已分叉，merge-upstream 必然 422 → 用 `git merge --no-ff`（不 rewrite 历史、
+#      不用 force-push）；冲突则开/更 issue 并失败，绝不发布半成品。
+#   3. .gitmodules 是相对 URL，在 fork 里会解析成不存在的 winffychu/ai-lubricant-*.git
+#      → 全程不初始化、不克隆子模块（submodules: false + 不做 submodule update）；
+#      gitlink 由索引层随主仓 tree 一起推走，发布链路（docker-publish.yml）自己处理。
+#
+# 发布门槛：**仅 ci.yml 通过即发布**（acceptance.yml / codespace.yml 各 60 分钟，
+#   不纳入自动门槛，由人按需手动跑）。
+
+name: Sync upstream & publish
+
+on:
+  schedule:
+    - cron: "17 2 * * 1"     # 每周一 02:17 UTC = 10:17 北京时间
+  workflow_dispatch:          # 手动/首次验证
+
+# 绝不并发，也不取消在跑的一次。
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write             # push main / push tag
+  actions: write              # gh workflow run（dispatch ci.yml / docker-publish.yml）
+  issues: write               # 冲突时开/更 issue
+
+env:
+  UPSTREAM_REPO: wuxin-gh/ai-lubricant
+  UPSTREAM_URL: https://github.com/wuxin-gh/ai-lubricant.git
+
+jobs:
+  sync:
+    name: sync-upstream
+    runs-on: ubuntu-latest
+    # ci.yml 自身 timeout 45 分钟，加上同步与发布触发，留足余量。
+    timeout-minutes: 90
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      # 只取主仓；子模块全程不碰（见文件头硬坑 3）。fetch-depth: 0 因为 merge 需要完整历史。
+      - name: Checkout（不初始化子模块）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          submodules: false
+
+      - name: 添加 upstream remote
+        run: |
+          set -euo pipefail
+          git remote add upstream "${UPSTREAM_URL}" 2>/dev/null \
+            || git remote set-url upstream "${UPSTREAM_URL}"
+          git fetch upstream main --no-tags
+          echo "UPSTREAM_SHA=$(git rev-parse upstream/main)" >> "$GITHUB_ENV"
+          echo "上游 main = $(git rev-parse --short upstream/main)"
+
+      # ── Phase 1：同步（幂等）──────────────────────────────────────────────
+      - name: Phase 1：合并上游（仅在有新提交时）
+        run: |
+          set -euo pipefail
+          if git merge-base --is-ancestor upstream/main HEAD; then
+            echo "upstream 无新提交（HEAD 已包含 upstream/main），Phase 1 空跑"
+            exit 0
+          fi
+          upstream_short="$(git rev-parse --short upstream/main)"
+          if git -c user.name=Kou -c user.email=kou@example.com \
+              merge --no-ff upstream/main \
+              -m "chore(sync): merge upstream ${UPSTREAM_REPO}@${upstream_short}"; then
+            git push origin HEAD:main
+            echo "已合并上游 ${upstream_short} 并推送 main"
+            echo "MERGED_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          # 冲突：先收集现场，再 abort（abort 后冲突状态就没了）。
+          conflict_files="$(git diff --name-only --diff-filter=U | sed 's/^/  - /' | head -50 || true)"
+          git merge --abort || true
+          body="$(printf '上游同步合并出现冲突，需人工处理（本工作流不会发布，避免半成品上线）。\n\n- 上游仓库: %s\n- 上游 sha: %s\n- 本工作流运行: %s/%s/actions/runs/%s\n\n冲突文件（最多 50 个）:\n%s\n\n处理方式：本地 `git fetch upstream main && git merge --no-ff upstream/main` 解决冲突后推 main，再手动触发本工作流（Phase 2 判据会继续走 CI + 发布）。\n' \
+            "${UPSTREAM_REPO}" "${UPSTREAM_SHA}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}" "${conflict_files}")"
+          issue_no="$(gh issue list --state open --search '上游同步冲突 in:title' \
+              --json number --jq '.[0].number // empty' || true)"
+          if [ -n "${issue_no}" ]; then
+            gh issue comment "${issue_no}" --body "${body}"
+            echo "已在 issue #${issue_no} 追加冲突信息"
+          else
+            gh issue create --title "上游同步冲突（需人工处理）" --body "${body}"
+            echo "已创建冲突 issue"
+          fi
+          echo "✗ 合并冲突，未发布任何内容" >&2
+          exit 1
+
+      # ── Phase 2：判定"是否有已同步但未发布的状态"────────────────────────
+      # 判据不能用 "HEAD 是否被打 tag"：那样任何人类 push 到 main 都会被误判为需要发布，
+      # 与 push 自动构建重复。改用"最新同步合并提交是否被 v* tag 覆盖"。
+      - name: Phase 2：判定是否需要发布
+        id: phase2
+        run: |
+          set -euo pipefail
+          git fetch --tags origin --force
+          newest_sync="$(git log --merges --grep='^chore(sync): merge upstream' -1 --format=%H HEAD)"
+          if [ -z "${newest_sync}" ]; then
+            echo "尚无上游同步合并提交，无需发布（空跑退出）"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          published=0
+          # 注意：必须用进程替换 < <(...) 而非管道 —— 管道会开子 shell，published 传不出来。
+          while read -r t; do
+            if [ -z "$t" ]; then continue; fi
+            # 该 tag 的提交是 newest_sync 的后代（或等值）→ 这次同步已经发布过。
+            if git merge-base --is-ancestor "${newest_sync}" "$(git rev-list -n1 "$t^{commit}")"; then
+              published=1
+              break
+            fi
+          done < <(git tag -l 'v*' --merged HEAD)
+
+          if [ "${published}" = "1" ]; then
+            echo "上游同步结果已发布（已有 v* tag 覆盖 ${newest_sync:0:8}），空跑退出"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "存在未发布的上游同步：${newest_sync}"
+          echo "NEWEST_SYNC=${newest_sync}" >> "$GITHUB_ENV"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+          echo "sync_sha=${newest_sync}" >> "$GITHUB_OUTPUT"
+
+      # ── CI 门禁：dispatch ci.yml 并等它跑完（失败即中断，不打 tag 不发布）──
+      # 用 headSha 精确匹配定位本次运行，避免取到别人的运行而让门禁失效。
+      # 匹配基准必须是**合并后的本地 HEAD**（GITHUB_SHA 是 checkout 时的旧 tip）。
+      - name: CI 门禁：dispatch ci.yml 并等待通过
+        if: steps.phase2.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          sync_sha="$(git rev-parse HEAD)"
+          echo "目标提交（本次 ci.yml 应测的 sha）: ${sync_sha}"
+          gh workflow run ci.yml --ref main
+          run_id=""
+          for attempt in $(seq 1 12); do
+            sleep 10
+            run_id="$(gh run list --workflow=ci.yml --branch=main --limit 20 \
+                --json databaseId,headSha \
+                --jq ".[] | select(.headSha==\"${sync_sha}\") | .databaseId" | head -1 || true)"
+            if [ -n "${run_id}" ]; then break; fi
+            echo "· 等待 headSha=${sync_sha} 的 ci.yml 运行出现在 API（第 ${attempt}/12 次）…"
+          done
+          if [ -z "${run_id}" ]; then
+            echo "✗ 未能定位到 headSha=${sync_sha} 的 ci.yml 运行；拒绝在未验证的情况下发布。" >&2
+            exit 1
+          fi
+          echo "CI_RUN_ID=${run_id}" >> "$GITHUB_ENV"
+          echo "ci.yml run id=${run_id}（headSha=${sync_sha}）"
+          gh run watch "${run_id}" --exit-status
+          echo "ci.yml 通过"
+
+      # ── 生成单调版本 tag（GitHub 侧）──────────────────────────────────────
+      # vYYMMDD.N：同日第 1 次 = .1，第 2 次 = .2；撞名即失败，绝不静默改写已有 tag。
+      - name: 生成单调版本 tag
+        id: ver
+        if: steps.phase2.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          # 读不到远端 tag 列表就报错退出——宁可失败也不猜版本号。
+          if ! git fetch --tags origin --force; then
+            echo "✗ 无法读取远端 tag 列表，拒绝猜测版本号" >&2
+            exit 1
+          fi
+          base="v$(date -u +%y%m%d)"
+          max=0
+          for t in $(git tag -l "${base}.*"); do
+            n="${t#${base}.}"
+            case "$n" in ''|*[!0-9]*) continue;; esac
+            # 注意：不要写 `[ ... ] && max="$n"` —— 在 set -e 下它作为循环体最后一条
+            # 语句且条件为假时会返回非 0，导致整个 job 意外退出。统一用 if 形式。
+            if [ "$n" -gt "$max" ]; then max="$n"; fi
+          done
+          TAG="${base}.$((max + 1))"
+          echo "TAG=${TAG}" >> "$GITHUB_ENV"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          git tag "${TAG}"
+          # GITHUB_TOKEN 的 tag push 不触发工作流（预期），发布由下一步显式 dispatch。
+          git push origin "refs/tags/${TAG}"
+          echo "已推送版本 tag ${TAG}"
+
+      # ── 显式触发发布（tag 驱动 → org.opencontainers.image.version = 该 tag）──
+      - name: 触发 docker-publish.yml（--ref <tag>）
+        if: steps.phase2.outputs.publish == 'true'
+        run: |
+          set -euo pipefail
+          gh workflow run docker-publish.yml --ref "${TAG}"
+          sleep 5
+          echo "最近的 docker-publish.yml 运行："
+          gh run list --workflow=docker-publish.yml --limit 5 \
+            --json databaseId,event,headBranch,status,url \
+            --jq '.[] | "  \(.databaseId) event=\(.event) ref=\(.headBranch) status=\(.status) \(.url)"' || true
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## 上游同步 / 发布"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 \`${UPSTREAM_REPO}\` main | \`${UPSTREAM_SHA:-<未取到>}\` |"
+            echo "| 本次合并提交 | \`${MERGED_SHA:-<Phase 1 未合并>}\` |"
+            echo "| 待发布的上游同步提交 | \`${NEWEST_SYNC:-<无>}\` |"
+            echo "| ci.yml run | \`${CI_RUN_ID:-<未运行>}\` |"
+            echo "| 版本 tag | \`${TAG:-<未生成>}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
