@@ -70,25 +70,64 @@ def test_resolve_postgres_database_prefers_env_file_over_default(tmp_path, monke
     ``ai_lubricant`` (underscore). The resolver must follow the .env value —
     otherwise the bootstrap creates the wrong DB and the app still fails."""
     monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
     env = tmp_path / ".env"
     env.write_text("POSTGRES_DATABASE=ai-lubricant\n", encoding="utf-8")
     assert lifecycle.resolve_postgres_database(env) == "ai-lubricant"
     assert lifecycle.resolve_postgres_database(env) != postgres.DEFAULT_DATABASE
 
 
+def test_resolve_postgres_database_env_var_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("POSTGRES_DATABASE", "from-env")
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("POSTGRES_DATABASE=from-file\n", encoding="utf-8")
+    assert lifecycle.resolve_postgres_database(env) == "from-env"
+
+
+def test_resolve_postgres_database_accepts_env_alias_postgres_db(tmp_path, monkeypatch):
+    """The app reads ``_required_text(("POSTGRES_DATABASE", "POSTGRES_DB"))`` —
+    the resolver must honour the legacy alias too, otherwise it creates the
+    module-default DB while the app connects to the aliased one."""
+    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    monkeypatch.setenv("POSTGRES_DB", "alias-from-env")
+    env = tmp_path / ".env"
+    assert lifecycle.resolve_postgres_database(env) == "alias-from-env"
+
+
+def test_resolve_postgres_database_accepts_file_alias_postgres_db(tmp_path, monkeypatch):
+    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("POSTGRES_DB=alias-from-file\n", encoding="utf-8")
+    assert lifecycle.resolve_postgres_database(env) == "alias-from-file"
+
+
+def test_resolve_postgres_database_matches_dotenv_override_false(tmp_path, monkeypatch):
+    """``python-dotenv`` loads ``.env`` with ``override=False``: the file is
+    merged *under* the environment. So with the file holding
+    ``POSTGRES_DATABASE`` and the environment holding the alias ``POSTGRES_DB``,
+    the app keeps the **file** value (``POSTGRES_DATABASE`` wins by key order,
+    and it is present because the environment never set it).
+
+    A naive two-pass lookup (env ``POSTGRES_DB`` first, then file) would return
+    ``alias-from-env`` here and create the wrong database. This is the case that
+    pins the merge semantics.
+    """
+    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    monkeypatch.setenv("POSTGRES_DB", "alias-from-env")
+    env = tmp_path / ".env"
+    env.write_text("POSTGRES_DATABASE=file-wins\n", encoding="utf-8")
+    assert lifecycle.resolve_postgres_database(env) == "file-wins"
+
+
 def test_resolve_postgres_database_falls_back_to_module_default(tmp_path, monkeypatch):
     monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    monkeypatch.delenv("POSTGRES_DB", raising=False)
     env = tmp_path / ".env"
     assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
     env.write_text("# only comments\n\n", encoding="utf-8")
     assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
-
-
-def test_resolve_postgres_database_env_var_wins(tmp_path, monkeypatch):
-    monkeypatch.setenv("POSTGRES_DATABASE", "from-env")
-    env = tmp_path / ".env"
-    env.write_text("POSTGRES_DATABASE=from-file\n", encoding="utf-8")
-    assert lifecycle.resolve_postgres_database(env) == "from-env"
 
 
 def test_redis_version_gate_rejects_old_redis():

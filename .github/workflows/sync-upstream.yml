@@ -50,8 +50,9 @@ jobs:
   sync:
     name: sync-upstream
     runs-on: ubuntu-latest
-    # ci.yml 自身 timeout 45 分钟，加上同步与发布触发，留足余量。
-    timeout-minutes: 90
+    # 最坏耗时：ci.yml 门禁 45 分钟 + docker-publish.yml 冷构建约 30 分钟
+    # （实测热缓存 0.7–0.8 分钟）= 75 分钟，取 120 留余量。
+    timeout-minutes: 120
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     steps:
@@ -188,8 +189,9 @@ jobs:
           for t in $(git tag -l "${base}.*"); do
             n="${t#${base}.}"
             case "$n" in ''|*[!0-9]*) continue;; esac
-            # 注意：不要写 `[ ... ] && max="$n"` —— 在 set -e 下它作为循环体最后一条
-            # 语句且条件为假时会返回非 0，导致整个 job 意外退出。统一用 if 形式。
+            # 用 if 而非 `[ ... ] && max="$n"`：属防御性写法，不是"否则会挂"。
+            # QA 实测（顶层 for 循环体内）该 && 写法 exit=0，不会触发 set -e 退出；
+            # 只有作为函数体或整脚本的最后一条语句时才会。if 形式更稳、可读性也更好。
             if [ "$n" -gt "$max" ]; then max="$n"; fi
           done
           TAG="${base}.$((max + 1))"
@@ -201,16 +203,53 @@ jobs:
           echo "已推送版本 tag ${TAG}"
 
       # ── 显式触发发布（tag 驱动 → org.opencontainers.image.version = 该 tag）──
-      - name: 触发 docker-publish.yml（--ref <tag>）
+      # 原子性：**tag 已推 ≠ 已发布**。Phase 2 的判据是"存在覆盖 newest_sync 的 v* tag"，
+      # 所以只要 tag 推上去了，之后无论 dispatch 未被受理还是构建失败，Phase 2 都会
+      # 永久判 publish=false —— 这次上游同步的发布就永久丢失（上游长期停滞时尤其致命）。
+      # 因此这里必须确认"本次 dispatch 真的产生了一个运行、且该运行成功"，否则回滚 tag。
+      # 回滚是安全的、自愈的：tag 删掉后下次运行 max 归 0，会重新生成同一个 ${base}.1 并重发。
+      - name: 触发 docker-publish.yml（--ref <tag>）并确认已受理
         if: steps.phase2.outputs.publish == 'true'
         run: |
           set -euo pipefail
           gh workflow run docker-publish.yml --ref "${TAG}"
-          sleep 5
-          echo "最近的 docker-publish.yml 运行："
-          gh run list --workflow=docker-publish.yml --limit 5 \
-            --json databaseId,event,headBranch,status,url \
-            --jq '.[] | "  \(.databaseId) event=\(.event) ref=\(.headBranch) status=\(.status) \(.url)"' || true
+
+          rollback() {
+            echo "✗ $1" >&2
+            echo "· 回滚 tag ${TAG}（否则 Phase 2 会永久误判为已发布）…" >&2
+            if git push origin ":refs/tags/${TAG}"; then
+              echo "  已回滚 ${TAG}；下次运行会重新生成并重发，可自愈。" >&2
+            else
+              echo "  ⚠ 回滚失败，请手工执行：git push origin :refs/tags/${TAG}" >&2
+            fi
+            echo "PUBLISH_ROLLED_BACK=1" >> "$GITHUB_ENV"
+            echo "· 人工补发命令：gh workflow run docker-publish.yml --ref ${TAG}" >&2
+            exit 1
+          }
+
+          # 定位本次 dispatch 产生的运行：event=workflow_dispatch 且 headBranch=<tag>。
+          # 实测依据：`gh workflow run --ref v260917.1` 产生的运行，其 head_branch 就是
+          # 'v260917.1'（不是 main、也不是 null），所以这个组合能精确命中本次运行。
+          run_id=""
+          for attempt in $(seq 1 12); do
+            sleep 10
+            run_id="$(gh run list --workflow=docker-publish.yml --limit 30 \
+                --json databaseId,event,headBranch \
+                --jq ".[] | select(.event==\"workflow_dispatch\") | select(.headBranch==\"${TAG}\") | .databaseId" \
+                | head -1 || true)"
+            if [ -n "${run_id}" ]; then break; fi
+            echo "· 等待 ${TAG} 的 workflow_dispatch 运行出现在 API（第 ${attempt}/12 次）…"
+          done
+          if [ -z "${run_id}" ]; then
+            rollback "未能定位到 ${TAG} 的 docker-publish.yml 运行（dispatch 未被受理或出现太慢）"
+          fi
+
+          echo "PUBLISH_RUN_ID=${run_id}" >> "$GITHUB_ENV"
+          echo "docker-publish.yml run id=${run_id}（ref=${TAG}）"
+          if ! gh run watch "${run_id}" --exit-status; then
+            rollback "docker-publish.yml run ${run_id} 未成功（构建失败或超时）"
+          fi
+          echo "✓ 已发布 ${TAG}（run ${run_id}）"
 
       - name: 汇总
         if: always()
@@ -225,4 +264,9 @@ jobs:
             echo "| 待发布的上游同步提交 | \`${NEWEST_SYNC:-<无>}\` |"
             echo "| ci.yml run | \`${CI_RUN_ID:-<未运行>}\` |"
             echo "| 版本 tag | \`${TAG:-<未生成>}\` |"
+            if [ "${PUBLISH_ROLLED_BACK:-0}" = "1" ]; then
+              echo "| 发布 | ⚠ **已回滚，未发布**（tag \`${TAG}\` 已删除；下次运行会重发） |"
+            else
+              echo "| 发布 | \`${PUBLISH_RUN_ID:-<未触发>}\` |"
+            fi
           } >> "$GITHUB_STEP_SUMMARY"

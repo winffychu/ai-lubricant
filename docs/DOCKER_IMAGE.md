@@ -48,6 +48,13 @@
 
 > 分支推送时 OCI label 仍是 `main`，**请一律用 `AI_LUBRICANT_VERSION` 核验实际版本**：
 > `docker exec ai-lubricant printenv AI_LUBRICANT_VERSION`。
+>
+> ⚠ **镜像 tag 是可变的**：对同一个 ref 重复发布（重跑工作流、或对同一个
+> `vYYMMDD.N` 再 dispatch 一次），tag 会指向新的 digest（`org.opencontainers.image.created`
+> 变化）—— 实测同一个 `v260917.1` 二次发布后 digest 由 `3e79b516…` 变为 `99d78463…`。
+> 因此**不要用"tag → digest"做版本核验**，核验运行版本一律以镜像内
+> `AI_LUBRICANT_VERSION` 为准（`script/upgrade_compose.sh` 就是这么做的）。如需
+> 不可变 tag，需另开 GHCR 的 immutable tag 策略或改用 digest 部署。
 
 产出的镜像地址：
 

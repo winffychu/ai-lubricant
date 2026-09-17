@@ -68,19 +68,30 @@ def _read_env_file(env_file: Path) -> dict[str, str]:
 def resolve_postgres_database(env_file: Path) -> str:
     """Return the *actual* database name the app will connect to.
 
-    Priority mirrors the app's own resolution (env > ``.env`` > built-in
-    default). Using the resolved name instead of :data:`postgres.DEFAULT_DATABASE`
-    is mandatory: ``.env.example`` / ``docker-compose.yml`` ship
+    Mirrors the app's own resolution exactly (``server/bootstrap_config.py``):
+
+    * the value is looked up under **both** ``POSTGRES_DATABASE`` and the legacy
+      alias ``POSTGRES_DB``, first non-empty wins — the app uses
+      ``_required_text(("POSTGRES_DATABASE", "POSTGRES_DB"), ...)``;
+    * real environment variables win over the ``.env`` file, matching
+      ``python-dotenv``'s ``override=False``: the file is merged *under* the
+      environment, not consulted in a second pass. (Merging matters: with
+      ``.env`` holding ``POSTGRES_DATABASE=A`` and the environment holding
+      ``POSTGRES_DB=B``, a two-pass lookup would pick ``B`` while the app picks
+      ``A`` — and we would create the wrong database.)
+
+    Using the resolved name instead of :data:`postgres.DEFAULT_DATABASE` is
+    mandatory: ``.env.example`` / ``docker-compose.yml`` ship
     ``POSTGRES_DATABASE=ai-lubricant`` while the module default is
     ``ai_lubricant`` — creating the wrong one leaves the target DB missing and
     the app still fails with ``InvalidCatalogNameError``.
     """
-    env_value = os.environ.get("POSTGRES_DATABASE", "").strip()
-    if env_value:
-        return env_value
-    file_value = _read_env_file(env_file).get("POSTGRES_DATABASE", "").strip()
-    if file_value:
-        return file_value
+    merged = dict(_read_env_file(env_file))
+    merged.update(os.environ)  # dotenv override=False：真实环境变量优先
+    for name in ("POSTGRES_DATABASE", "POSTGRES_DB"):
+        value = (merged.get(name) or "").strip()
+        if value:
+            return value
     return postgres.DEFAULT_DATABASE
 
 
