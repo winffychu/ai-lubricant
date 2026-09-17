@@ -47,8 +47,14 @@
 | `REDIS_MAX_CONNECTIONS` | `max_connections` | 两 | 是 | — | 单进程连接池上限，>=1 |
 | `REDIS_STREAM_TIMEOUT` | `stream_timeout` | 数据 | 否 | 10 | 单条命令等回包秒数，超时自愈重连；不影响 pubsub |
 | `REDIS_POOL_TIMEOUT` | `pool_timeout` | 数据 | 否 | 10 | 从池获取连接的最长等待秒数 |
-| — | `prefix_key` | 两 | 是 | — | Redis key 前缀（ini-only，无环境变量） |
+| `REDIS_PREFIX_KEY` | `prefix_key` | 两 | 是 | `ai_lubricant` | Redis key 前缀；native 形态（exe / supervisord / 单文件）由 `native_deps` 自动写入 `.env` |
 | — | `decode_responses` | 两 | 是 | — | bool，ini-only，必须 `true`/`false` |
+
+> **前缀变更与既有部署（重要）**：模板默认值已从 legacy 的 `marsview` 统一为 `ai_lubricant`（与 `POSTGRES_USER` / 库名口径一致）。
+> `.env` 已在 `.gitignore`，且 `native_deps.write_env_file()` 是 append-if-missing、`script/init_compose_env.py` 只 upsert 3 个密钥——**既有部署的 `.env` 不会被任何流程覆盖，Redis 键空间保持不变**。
+> 仅当运维**手工**用新模板覆盖既有 `.env` 时，前缀才会从 `marsview` 切到 `ai_lubricant`，表现为冻结态 / 智能选择评分 / 冷却索引的冷启动（均为运行态，权威数据在 PG，可重建）。迁移二选一：
+> 1. **推荐（零风险）**：既有 `marsview` 部署不动 `.env`，只有新建部署使用 `ai_lubricant`；两套前缀可在同一 Redis 实例共存。
+> 2. **想统一前缀**：停机窗口内重命名键（应用须先停，避免写入竞争）：`redis-cli --scan --pattern 'marsview:*'` 逐键 `RENAME` 为 `ai_lubricant:*`。**共享 Redis 上必须先确认 `marsview:*` 全部属于本部署**，否则会误改他人数据。
 
 ### `[ai_lubricant]` 兼容层 + 节点控制面
 

@@ -46,7 +46,7 @@ def test_postgres_environment_overrides_bootstrap_file(monkeypatch):
 def _minimal_redis_env(monkeypatch, **overrides) -> None:
     _clear_config_env(monkeypatch)
     defaults = {
-        "REDIS_PREFIX_KEY": "marsview",
+        "REDIS_PREFIX_KEY": "ai_lubricant",
         "REDIS_HOST": "localhost",
         "REDIS_PORT": "6379",
         "REDIS_DB": "0",
@@ -84,7 +84,7 @@ def test_invalid_redis_port_fails(monkeypatch):
 def test_missing_redis_decode_responses_fails(monkeypatch):
     _clear_config_env(monkeypatch)
     for key in ("REDIS_HOST", "REDIS_PORT", "REDIS_DB", "REDIS_PREFIX_KEY", "REDIS_MAX_CONNECTIONS"):
-        monkeypatch.setenv(key, {"REDIS_HOST": "localhost", "REDIS_PORT": "6379", "REDIS_DB": "0", "REDIS_PREFIX_KEY": "marsview", "REDIS_MAX_CONNECTIONS": "500"}[key])
+        monkeypatch.setenv(key, {"REDIS_HOST": "localhost", "REDIS_PORT": "6379", "REDIS_DB": "0", "REDIS_PREFIX_KEY": "ai_lubricant", "REDIS_MAX_CONNECTIONS": "500"}[key])
     monkeypatch.delenv("REDIS_DECODE_RESPONSES", raising=False)
     with pytest.raises(ConfigurationError, match="redis.decode_responses"):
         bootstrap_config.get_redis_config()
