@@ -12,6 +12,8 @@ at import time and pull heavy deps. Only stdlib + ``aiohttp`` + ``loguru`` +
 
 Three shapes consume the same :mod:`native_deps.lifecycle`:
   * Windows exe      — ``desktop/main_window.py`` inserts a provision phase.
-  * Linux supervisord — a one-shot ``[program:provision]`` runs ``cli provision``.
-  * Linux single-file — ``scripts/native_launch.sh`` → ``python -m native_deps.cli up``.
+  * Linux supervisord — ``native_deps.cli supervisord-conf`` runs provision
+    **including database creation** (start the local DBs once → create → stop)
+    and then writes the conf; ``supervisord -c`` owns the DB processes.
+  * Linux single-file — ``script/native_launch.sh`` → ``python -m native_deps.cli up``.
 """

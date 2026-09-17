@@ -7,6 +7,10 @@ Two layers:
   * :class:`DepsRuntime` — spawns the three DB processes as children, waits
     for protocol-level readiness, creates databases, tears them down on exit.
     Used by the exe and Linux-single-file shapes.
+
+:func:`ensure_databases` bridges the two: the supervisord shape has no
+:class:`DepsRuntime`, so it calls this once before generating the conf to create
+the target databases (start → wait → create → stop, idempotent).
 """
 from __future__ import annotations
 
@@ -42,6 +46,42 @@ class DepsConfig:
 
 def _env_default(key: str, default: str) -> str:
     return os.environ.get(key, default)
+
+
+def _read_env_file(env_file: Path) -> dict[str, str]:
+    """Parse ``KEY=VALUE`` lines from an env file (blanks/comments ignored)."""
+    values: dict[str, str] = {}
+    if not env_file.exists():
+        return values
+    for line in env_file.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        values[key.strip()] = value
+    return values
+
+
+def resolve_postgres_database(env_file: Path) -> str:
+    """Return the *actual* database name the app will connect to.
+
+    Priority mirrors the app's own resolution (env > ``.env`` > built-in
+    default). Using the resolved name instead of :data:`postgres.DEFAULT_DATABASE`
+    is mandatory: ``.env.example`` / ``docker-compose.yml`` ship
+    ``POSTGRES_DATABASE=ai-lubricant`` while the module default is
+    ``ai_lubricant`` — creating the wrong one leaves the target DB missing and
+    the app still fails with ``InvalidCatalogNameError``.
+    """
+    env_value = os.environ.get("POSTGRES_DATABASE", "").strip()
+    if env_value:
+        return env_value
+    file_value = _read_env_file(env_file).get("POSTGRES_DATABASE", "").strip()
+    if file_value:
+        return file_value
+    return postgres.DEFAULT_DATABASE
 
 
 async def ensure_all(clickhouse_enabled: bool | None = None) -> DepsConfig:
@@ -81,6 +121,50 @@ async def _ensure_or_none(kind: str, *, required: bool) -> Path | None:
             raise
         logger.warning("[native-deps] {} skipped: {}", kind, exc)
         return None
+
+
+async def ensure_databases(cfg: DepsConfig, env_file: Path) -> None:
+    """Start the local DBs once, create the target databases, then stop them.
+
+    Idempotent. Required by the supervisord shape: :func:`ensure_all` only runs
+    ``initdb`` and never starts a process, while ``ensure_database`` otherwise
+    lives on the :class:`DepsRuntime` path (``up`` / exe) — so supervisord would
+    start the app programs against a database that does not exist yet, and they
+    would restart until FATAL with ``InvalidCatalogNameError``. Same approach the
+    codespace entrypoint used inline.
+    """
+    if cfg.postgres_local and cfg.postgres_exe is not None:
+        database = resolve_postgres_database(env_file)
+        child = subprocess.Popen(postgres.start_command(cfg.postgres_exe))
+        try:
+            if not await postgres.wait_ready(cfg.postgres_exe, timeout=60):
+                raise RuntimeError("postgres did not become ready; cannot create database")
+            postgres.ensure_database(cfg.postgres_exe, database)
+            logger.info("[native-deps] postgres database ensured: {}", database)
+        finally:
+            with contextlib.suppress(Exception):
+                postgres.stop(cfg.postgres_exe)
+            with contextlib.suppress(Exception):
+                child.wait(timeout=15)
+            if child.poll() is None:
+                with contextlib.suppress(Exception):
+                    child.kill()
+    if cfg.clickhouse_enabled and cfg.clickhouse_exe is not None:
+        child = subprocess.Popen(clickhouse.start_command(cfg.clickhouse_exe))
+        try:
+            if await clickhouse.wait_ready():
+                clickhouse.ensure_database(cfg.clickhouse_exe)
+                logger.info("[native-deps] clickhouse database ensured: {}", clickhouse.DEFAULT_DATABASE)
+            else:
+                logger.warning("[native-deps] clickhouse not ready; skipping database create (optional)")
+        finally:
+            with contextlib.suppress(Exception):
+                clickhouse.stop(cfg.clickhouse_exe)
+            with contextlib.suppress(Exception):
+                child.wait(timeout=15)
+            if child.poll() is None:
+                with contextlib.suppress(Exception):
+                    child.kill()
 
 
 def env_updates(cfg: DepsConfig) -> dict[str, str]:

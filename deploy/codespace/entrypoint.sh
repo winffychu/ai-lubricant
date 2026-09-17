@@ -38,37 +38,7 @@ if [ ! -f "${conf_path}" ]; then
 fi
 echo "[codespace] supervisord config: ${conf_path}"
 
-# ---- 确保目标数据库存在（幂等）----
-# supervisord 形态只生成 conf（native_deps.ensure_all 只做 initdb、不起进程），不会走
-# DepsRuntime.start_all 那条「起 PG → 建库」的路径，因此这里在 supervisord 拉起 PG 之前，
-# 先临时起一次 PG、等就绪、建库、再停掉：保证 main / node-server / tunnel-server 首次
-# 启动时 POSTGRES_DATABASE 已存在（否则 asyncpg 报 InvalidCatalogNameError，进程反复重启
-# 直至 FATAL、对外 7860 无应答）。全程幂等：库已存在则跳过；PG 数据在 NATIVE_DEPS_ROOT 内持久。
-python - <<'PY'
-import asyncio
-import subprocess
-
-from native_deps import binaries, postgres
-
-
-async def _bootstrap_database() -> None:
-    exe = await binaries.ensure_dep("postgres")
-    child = subprocess.Popen(postgres.start_command(exe))
-    try:
-        if not await postgres.wait_ready(exe, timeout=60):
-            raise SystemExit("[codespace] postgres 未就绪，无法建库")
-        postgres.ensure_database(exe)
-        print(f"[codespace] database ensured: {postgres.DEFAULT_DATABASE}")
-    finally:
-        postgres.stop(exe)
-        try:
-            child.wait(timeout=15)
-        except Exception:
-            child.kill()
-
-
-asyncio.run(_bootstrap_database())
-PY
-
 # ---- 前台运行 supervisord，托管全部 program ----
+# 建库已由上面的 supervisord-conf 完成（native_deps.lifecycle.ensure_databases：
+# 起 PG → 等就绪 → 按 POSTGRES_DATABASE 建库 → 停 PG，幂等），此处不再重复自举。
 exec supervisord -c "${conf_path}" -n

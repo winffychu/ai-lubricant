@@ -15,7 +15,7 @@ _proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _proj not in sys.path:
     sys.path.insert(0, _proj)
 
-from native_deps import lifecycle, redis, sources
+from native_deps import lifecycle, postgres, redis, sources
 from native_deps.lifecycle import DepsConfig
 
 
@@ -63,6 +63,32 @@ def test_env_updates_includes_clickhouse_only_when_enabled():
     updates = lifecycle.env_updates(with_ch)
     assert updates["CLICKHOUSE_REQUEST_PAYLOAD_ENABLED"] == "true"
     assert updates["CLICKHOUSE_ADDR"].startswith("127.0.0.1:")
+
+
+def test_resolve_postgres_database_prefers_env_file_over_default(tmp_path, monkeypatch):
+    """``.env`` may pin ``ai-lubricant`` (hyphen) while the module default is
+    ``ai_lubricant`` (underscore). The resolver must follow the .env value —
+    otherwise the bootstrap creates the wrong DB and the app still fails."""
+    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    env = tmp_path / ".env"
+    env.write_text("POSTGRES_DATABASE=ai-lubricant\n", encoding="utf-8")
+    assert lifecycle.resolve_postgres_database(env) == "ai-lubricant"
+    assert lifecycle.resolve_postgres_database(env) != postgres.DEFAULT_DATABASE
+
+
+def test_resolve_postgres_database_falls_back_to_module_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
+    env = tmp_path / ".env"
+    assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
+    env.write_text("# only comments\n\n", encoding="utf-8")
+    assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
+
+
+def test_resolve_postgres_database_env_var_wins(tmp_path, monkeypatch):
+    monkeypatch.setenv("POSTGRES_DATABASE", "from-env")
+    env = tmp_path / ".env"
+    env.write_text("POSTGRES_DATABASE=from-file\n", encoding="utf-8")
+    assert lifecycle.resolve_postgres_database(env) == "from-env"
 
 
 def test_redis_version_gate_rejects_old_redis():

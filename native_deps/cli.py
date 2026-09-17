@@ -1,10 +1,13 @@
 """Command-line entry: ``python -m native_deps.cli {provision,up,down,status}``.
 
 * ``provision`` — download + initdb + write configs + write ``.env``. No process
-  spawn. Used by the supervisord shape before ``supervisord -c``.
+  spawn.
 * ``up``       — provision + start the DBs + start main/node/tunnel in the
   foreground (the Linux single-file shape). Traps signals for clean teardown.
 * ``down``     — stop a running native stack (best-effort by pidfile/probe).
+* ``supervisord-conf`` — provision + **create the target databases** (start the
+  local DBs once, create, stop) + write the supervisord conf. Used by the
+  supervisord shape (form E / codespace) before ``supervisord -c``.
 """
 from __future__ import annotations
 
@@ -108,12 +111,21 @@ async def cmd_down(args: argparse.Namespace) -> int:
 
 
 async def cmd_supervisord_conf(args: argparse.Namespace) -> int:
+    """Provision + create the target databases + generate the supervisord conf.
+
+    The supervisord shape never runs :class:`lifecycle.DepsRuntime` (the DBs are
+    ``[program]`` blocks), so the database-create step has to happen here, before
+    the conf is generated and supervisord starts the app programs.
+    """
     from . import supervisord_config
 
     env_file = _env_file()
     lifecycle.ensure_security_keys(env_file)
     cfg = await lifecycle.ensure_all()
     lifecycle.write_env_file(env_file, lifecycle.env_updates(cfg))
+    # Start PG (and ClickHouse when enabled) once, create the resolved databases,
+    # stop them again — idempotent, and must run before supervisord comes up.
+    await lifecycle.ensure_databases(cfg, env_file)
     conf = supervisord_config.generate(cfg)
     print(f"supervisord config: {conf}")
     print(f"run: supervisord -c {conf} -n")
