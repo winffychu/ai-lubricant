@@ -15,7 +15,12 @@ from pydantic import BaseModel, Field
 from db import PostgresClient
 from .deps import audit_user_action, get_current_user, resolve_team_id
 from .models import User
-from .node_client import get_local_node_client
+from .node_client import (
+    Code,
+    NodeServerUnavailable,
+    RPCError,
+    get_local_node_client,
+)
 
 router = APIRouter(prefix="/api/v1/users/editors", tags=["user-platform-editors"])
 admin_router = APIRouter(prefix="/api/v1/teams/editors", tags=["user-platform-editor-admin"])
@@ -932,6 +937,47 @@ async def _live_editor_session_runtime(editor_id: str, session_id: str, user: Us
     return node_session_id
 
 
+async def _ensure_editor_session_runtime(editor_id: str, session: dict) -> str:
+    """Return a runtime handle this session can actually deliver a turn to.
+
+    Mirrors the task path's ``_ensure_task_runtime_for_send``: trusting the stored
+    handle is not enough. The node keeps a stopped session object in its map (a
+    previous run exited, or a connection drop cancelled the run), and
+    ``SendSessionInput`` is fire-and-forget — it writes the frame onto the wire
+    and returns ``accepted=True`` without waiting for the node, so a message sent
+    to a dead runtime was accepted by the control plane and then silently dropped
+    on the node. The page showed "生成中" forever with nothing in the request log,
+    because the turn never reached the LLM.
+
+    ``StartNodeSessionRuntime`` is the probe AND the repair: it is an idempotent
+    no-op for a running session and restarts a stopped one. A binding the node no
+    longer knows about surfaces as NOT_FOUND; the node being offline surfaces as
+    UNAVAILABLE. Both are raised so the caller reports a reason instead of
+    pretending the message was delivered.
+    """
+    node_session_id = (session.get("node_session_id") or "").strip()
+    if not node_session_id:
+        raise HTTPException(status_code=409, detail="会话尚未绑定运行时")
+    client = get_local_node_client()
+    try:
+        await client.start_node_session_runtime(node_session_id)
+    except NodeServerUnavailable as exc:
+        raise HTTPException(status_code=503, detail=f"节点控制面暂不可用: {exc}") from exc
+    except RPCError as exc:
+        if exc.code == Code.UNAVAILABLE:
+            raise HTTPException(status_code=503, detail=f"运行节点离线: {exc.message}") from exc
+        if exc.code == Code.NOT_FOUND:
+            # The node lost the session (restart / cascade delete). The row still
+            # points at it, so every later send would 404 the same way. Say so
+            # instead of returning a phantom accepted.
+            raise HTTPException(
+                status_code=409,
+                detail="会话运行时已失效，请重新创建任务会话",
+            ) from exc
+        raise HTTPException(status_code=502, detail=f"节点拒绝了会话运行时: {exc.message}") from exc
+    return node_session_id
+
+
 @router.post("/{editor_id}/sessions/{session_id}/messages")
 async def send_editor_session_message(
     editor_id: str,
@@ -949,9 +995,10 @@ async def send_editor_session_message(
         raise HTTPException(status_code=422, detail="消息不能为空")
     if session.get("status") not in ("active", "pending_first_request"):
         raise HTTPException(status_code=409, detail="会话当前不可发送消息")
-    node_session_id = (session.get("node_session_id") or "").strip()
-    if not node_session_id:
-        raise HTTPException(status_code=409, detail="会话尚未绑定运行时")
+    # Probe/repair the runtime before sending. SendSessionInput is
+    # fire-and-forget, so without this a message to a stopped runtime was
+    # accepted and then silently dropped on the node.
+    node_session_id = await _ensure_editor_session_runtime(editor_id, session)
     result = await get_local_node_client().send_session_input(
         node_session_id,
         "human_message",
@@ -959,6 +1006,13 @@ async def send_editor_session_message(
         model=session.get("model") or "",
         mode=session.get("mode") or "",
     )
+    if result.get("accepted") is False:
+        # The control plane could not hand the frame to the node. Report it
+        # rather than returning accepted and leaving the UI waiting.
+        raise HTTPException(
+            status_code=503,
+            detail=f"消息投递失败: {result.get('error') or '节点未受理'}",
+        )
     await audit_user_action(
         request,
         user,

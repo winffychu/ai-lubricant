@@ -278,3 +278,130 @@ async def test_remote_host_exec_uses_unary_json(remote_client):
 
 def test_get_local_node_client_returns_remote_client():
     assert get_local_node_client() is get_local_node_client()
+
+
+@pytest.mark.asyncio
+async def test_upgrade_rpcs_use_long_timeout(remote_client, monkeypatch):
+    """升级类 RPC 的数据面超时必须严格大于控制面的最坏窗口。
+
+    节点 RuntimeUpgrade 是「下载归档 + 校验 sha256 + 解压 + 激活」全部做完才
+    ack（nodes/execution/handler.go），节点自己的下载预算就有 10 分钟；控制面
+    用 ARCHIVE_INSTALL_ACK_TIMEOUT 覆盖它。而统一升级 UpgradeNode 是 runtime →
+    self-upgrade 两步串行，最坏是两者之和。数据面若比控制面短，就会先掐断，
+    用户看到假 503 而节点其实还在正常下载。
+    """
+    import aiohttp
+
+    from node_server.service import UPGRADE_TOTAL_ACK_BUDGET
+    from user_platform.node_client.client import NODE_LONG_RPC_TIMEOUT
+
+    assert NODE_LONG_RPC_TIMEOUT > UPGRADE_TOTAL_ACK_BUDGET
+
+    captured: dict = {}
+
+    def _capture(**k):
+        captured.update(k)
+        return ("timeout", k)
+
+    monkeypatch.setattr(aiohttp, "ClientTimeout", _capture)
+
+    client, _ = remote_client
+
+    await client.upgrade_node(
+        "n1",
+        runtime_target={"download_url": "https://x/r.tgz", "sha256": "a"},
+        node_target={"download_url": "https://x/n.tgz", "sha256": "b"},
+    )
+    assert captured["total"] == NODE_LONG_RPC_TIMEOUT
+
+    captured.clear()
+    await client.self_upgrade_node("n1", target={"download_url": "https://x/n.tgz", "sha256": "b"})
+    assert captured["total"] == NODE_LONG_RPC_TIMEOUT
+
+    captured.clear()
+    await client.runtime_upgrade_node("n1", target={"download_url": "https://x/r.tgz", "sha256": "a"})
+    assert captured["total"] == NODE_LONG_RPC_TIMEOUT
+
+
+def test_timeout_ladder_is_strictly_increasing():
+    """整条链路的超时预算必须逐层放大，否则外层先掐断、内层窗口永远到不了。
+
+    节点下载归档 600s < 控制面 runtime ack < 数据面 < 前端。
+    """
+    from node_server.service import (
+        ARCHIVE_INSTALL_ACK_TIMEOUT,
+        EDITOR_ACK_TIMEOUT,
+        SELF_UPGRADE_ACK_TIMEOUT,
+        UPGRADE_TOTAL_ACK_BUDGET,
+    )
+    from user_platform.node_client.client import NODE_LONG_RPC_TIMEOUT
+
+    # 节点侧 downloadTo 的预算是 10 分钟，控制面 ack 窗口必须包住它。
+    node_download_budget = 10 * 60
+    assert ARCHIVE_INSTALL_ACK_TIMEOUT > node_download_budget
+
+    # 统一升级两步串行 = 两者之和（不是取较大者）。
+    assert UPGRADE_TOTAL_ACK_BUDGET == ARCHIVE_INSTALL_ACK_TIMEOUT + SELF_UPGRADE_ACK_TIMEOUT
+
+    # 数据面必须包住控制面的最坏情况，且包住编辑器安装窗口。
+    assert NODE_LONG_RPC_TIMEOUT > UPGRADE_TOTAL_ACK_BUDGET
+    assert NODE_LONG_RPC_TIMEOUT > EDITOR_ACK_TIMEOUT
+
+
+@pytest.mark.asyncio
+async def test_host_exec_timeout_covers_requested_budget(remote_client, monkeypatch):
+    """host_exec 的数据面超时必须覆盖命令自身的 timeout_ms（节点按它执行），
+    否则长命令会被 30s 全局默认掐断而节点仍在跑。"""
+    import aiohttp
+
+    from user_platform.node_client.client import (
+        NODE_HOST_EXEC_MAX_TIMEOUT_MS,
+        NODE_HOST_EXEC_SLACK,
+    )
+
+    captured: dict = {}
+
+    def _capture(**k):
+        captured.update(k)
+        return ("timeout", k)
+
+    monkeypatch.setattr(aiohttp, "ClientTimeout", _capture)
+    client, _ = remote_client
+
+    # 5 分钟预算的命令：超时必须是 300s + 余量，而不是 30s 默认值。
+    await client.host_exec("n1", "sleep 300", timeout_ms=300_000)
+    assert captured["total"] == 300 + NODE_HOST_EXEC_SLACK
+
+    # 未指定 timeout_ms：按节点默认预算（2 分钟）推导，不能退回全局 30s。
+    captured.clear()
+    await client.host_exec("n1", "ls")
+    assert captured["total"] > 120
+
+    # 超过节点硬顶的请求被 clamp 到 10 分钟。
+    captured.clear()
+    await client.host_exec("n1", "sleep 9999", timeout_ms=99_000_000)
+    assert captured["total"] == NODE_HOST_EXEC_MAX_TIMEOUT_MS / 1000.0 + NODE_HOST_EXEC_SLACK
+
+
+@pytest.mark.asyncio
+async def test_remote_transport_timeout_surfaces_diagnosable_message(remote_client):
+    """asyncio.TimeoutError() str() 为空串；包装层必须补出类型名 + 超时秒数，
+    不能是裸冒号「控制面 X 不可用:」，否则运维无法判断是超时还是连接拒绝。"""
+    import asyncio
+
+    client, sess = remote_client
+
+    class _TimeoutResponse(_FakeResponse):
+        async def __aenter__(self):
+            raise asyncio.TimeoutError()
+
+    sess._next = _TimeoutResponse(200, {})
+
+    with pytest.raises(NodeServerUnavailable) as excinfo:
+        await client.list_nodes()
+    msg = str(excinfo.value)
+    # fixture 设 agent_compose_timeout=7；超时秒数与类型名都要出现在消息里，
+    # 不能是裸冒号「控制面 ListNodes 不可用:」。
+    assert "TimeoutError" in msg
+    assert "7s" in msg
+    assert not msg.endswith("不可用:")

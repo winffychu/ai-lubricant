@@ -492,6 +492,54 @@ def test_sanitize_strips_kv_and_normalizes(variant):
     # none + tools → 整组删除（上游对 none+tools 组合报错）
     out4 = mod._sanitize_outbound_body({"tool_choice": "none", "tools": [{"x": 1}]})
     assert "tool_choice" not in out4 and "tools" not in out4
-    # 无指纹原对象直返（零拷贝）
-    clean = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "tool_choice": "auto"}
+    # 首条已是 system 且无指纹 → 原对象直返（零拷贝）
+    clean = {"model": "m", "messages": [{"role": "system", "content": "hi"}], "tool_choice": "auto"}
     assert mod._sanitize_outbound_body(clean) is clean
+
+
+def test_payload_injects_fallback_system_e2e(channel_cls):
+    """真实 code_loader 加载的适配器类 payload 钩子端到端：无 system 的 openai body
+    出站前被注入兜底 system，且首条是 "You are CodeBuddy Code."。"""
+    hook = channel_cls._spec_hooks["payload"]
+    p = _stub(next(iter(_VARIANTS.values())))
+    p._channel = None
+    base = {"model": "m", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+    out = hook(p, "openai", "m", base["messages"], True, {"_base_payload": base})
+    assert out["messages"][0] == {"role": "system", "content": "You are CodeBuddy Code."}
+    assert out["messages"][1]["content"] == "hi"
+
+
+def test_ensure_head_system_injected_when_missing(variant):
+    """首条非 system 时前置兜底 system（对齐 workbuddy2api ensureConsoleSystem）。
+
+    上游 console 域要求 messages 首条为 system，纯 user/assistant 的请求
+    （标题生成、探测等）会被判非法调用（11128）。
+    """
+    mod = _module(variant)
+    assert mod._FALLBACK_SYSTEM == "You are CodeBuddy Code."
+
+    body = {"model": "m", "messages": [{"role": "user", "content": "hi"}]}
+    out = mod._sanitize_outbound_body(body)
+    assert len(out["messages"]) == 2
+    assert out["messages"][0] == {"role": "system", "content": "You are CodeBuddy Code."}
+    assert out["messages"][1]["role"] == "user" and out["messages"][1]["content"] == "hi"
+    # 不污染原对象（与请求日志/客户端共享的 messages 列表不动）
+    assert len(body["messages"]) == 1 and body["messages"][0]["role"] == "user"
+
+    # 幂等：重试二次过钩子不再注入（不滚雪球）
+    out2 = mod._sanitize_outbound_body(out)
+    assert out2["messages"] == out["messages"]
+
+    # 首条已是 system：不重复注入
+    has = {"messages": [{"role": "system", "content": "s"}, {"role": "user", "content": "u"}]}
+    assert len(mod._sanitize_outbound_body(has)["messages"]) == 2
+
+    # developer 归一后首条即 system：不再额外注入
+    dev = {"messages": [{"role": "developer", "content": "d"}, {"role": "user", "content": "u"}]}
+    outd = mod._sanitize_outbound_body(dev)
+    assert len(outd["messages"]) == 2 and outd["messages"][0]["role"] == "system"
+
+    # 空 messages / 非列表 / 无 messages → 不注入（防御）
+    for empty in ({"messages": []}, {"messages": None}, {}, {"messages": "x"}):
+        oute = mod._sanitize_outbound_body(empty)
+        assert "messages" not in oute or oute.get("messages") == empty.get("messages"), empty

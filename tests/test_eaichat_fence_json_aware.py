@@ -5,6 +5,7 @@
 （它在写一个还原 SSE 帧的复现脚本）。框架那套按裸子串找 ``` 闭合会在参数中间
 切断块、调用整个丢失；渠道内的 JSON 字符串态感知实现必须切出完整块并解析成功。
 """
+import asyncio
 import json
 import types
 
@@ -628,6 +629,90 @@ def test_thinking_falls_back_when_model_map_empty():
     CH._MODEL_THINK_MAP.clear()
     assert CH._resolve_thinking("unknown", _TOOLS, False) is False
     assert CH._resolve_thinking("unknown", _TOOLS, True) is True
+
+
+# ==================== fetch_models 的失败信封（现网 2026-09-16 报错）====================
+# 上游登录态失效时 queryModels 回 {"resultCode": xxx, "data": null}——键在、值为 None。
+# 原实现 `resp.get("data", [])` 拿不到默认值，迭代 None 抛 TypeError 崩掉整轮
+# refresh_models（现网间歇复现，日志里 17:20 起 6 次）。修法是显式判 data 是不是 list，
+# 失败按框架约定写 _last_fetch_models_error 并返回空列表，让同步跳过本轮而不是炸掉。
+
+
+class _FakeFetchProvider:
+    """fetch_models 只用到这些属性（其余链路不碰）。
+
+    名字不与上面的 _FakeProvider 复用：同名会在模块级把那个定义覆盖掉，
+    连带炸掉依赖它的消息装配用例。
+    """
+
+    PROVIDER_NAME = "ch-23"
+    username = "u@example.com"
+
+    def __init__(self):
+        self._last_fetch_models_error = ""
+        self.base_url = "https://eaichat.example.com"
+
+
+def _stub_send_request(monkeypatch, resp):
+    """把 spec 模块级的 _send_request 换成返回固定响应体的假实现。
+
+    fetch_models 里是模块级按名调用（`_send_request(...)`），所以打模块属性即可；
+    顺带跳过 init_auth 那条真实登录链路。
+    """
+
+    async def fake(p, method, path, params=None, data=None, is_auth=True):
+        return resp
+
+    monkeypatch.setattr(CH, "_send_request", fake)
+
+
+def test_fetch_models_null_data_returns_empty_without_crashing(monkeypatch):
+    """data 为 null（登录态失效）→ 返回空列表 + 写失败原因，不再 TypeError 崩掉整轮同步。"""
+    _stub_send_request(monkeypatch, {"resultCode": 401, "resultMsg": "未登录", "data": None})
+    p = _FakeFetchProvider()
+
+    models = asyncio.run(CH.EaiChatChannel.fetch_models(p))
+
+    assert models == []
+    assert p._last_fetch_models_error
+    assert "401" in p._last_fetch_models_error
+
+
+def test_fetch_models_nonzero_result_code_without_data_key(monkeypatch):
+    """data 键整个缺失（另一形态的失败信封）同样不崩。"""
+    _stub_send_request(monkeypatch, {"resultCode": 500, "resultMsg": "系统繁忙"})
+    p = _FakeFetchProvider()
+
+    assert asyncio.run(CH.EaiChatChannel.fetch_models(p)) == []
+    assert p._last_fetch_models_error
+
+
+def test_fetch_models_success_still_parses_and_clears_error(monkeypatch):
+    """成功路径不受影响：照常解析出模型，并把上一轮的错误清空。"""
+    _stub_send_request(monkeypatch, {"resultCode": 0, "data": [
+        {"model": "m-1", "keyModel": "k-1", "modelName": "模型一"},
+        {"model": "m-2", "keyModel": "k-2"},
+    ]})
+    p = _FakeFetchProvider()
+    p._last_fetch_models_error = "上一轮的旧错误"
+
+    models = asyncio.run(CH.EaiChatChannel.fetch_models(p))
+
+    assert [m["id"] for m in models] == ["m-1", "m-2"]
+    assert models[1]["name"] == "m-2"          # 无 modelName 时回落 id
+    assert CH._MODEL_KEY_MAP["m-2"] == "k-2"   # 聊天要用的 keyModel 映射照旧维护
+    assert p._last_fetch_models_error == ""
+
+
+def test_fetch_models_failure_keeps_previous_key_model_map(monkeypatch):
+    """失败时不清 keyModel 映射——_resolve_key_model 还能拿上一轮结果兜底。"""
+    _stub_send_request(monkeypatch, {"resultCode": 401, "data": None})
+    CH._MODEL_KEY_MAP.clear()
+    CH._MODEL_KEY_MAP["m-keep"] = "k-keep"
+    p = _FakeFetchProvider()
+
+    assert asyncio.run(CH.EaiChatChannel.fetch_models(p)) == []
+    assert CH._MODEL_KEY_MAP.get("m-keep") == "k-keep"
 
 
 if __name__ == "__main__":

@@ -94,3 +94,70 @@ async def test_resolve_caller_derived_key_respects_child_disabled(monkeypatch):
         await agent_api._resolve_caller_api_key(7, "user-1")
     assert exc.value.status_code == 403
     assert "禁用" in exc.value.detail
+
+
+def _patch_admin_role(monkeypatch, is_admin: bool):
+    """把 _caller_is_admin 钉成固定结果，隔离 User 查询（本文件不建 tortoise 库）。"""
+    async def _fake(caller):
+        return is_admin
+
+    monkeypatch.setattr(agent_api, "_caller_is_admin", _fake)
+
+
+@pytest.mark.asyncio
+async def test_admin_can_use_key_outside_own_scope(monkeypatch):
+    """平台管理员（role==admin）越出用户域时放宽到全平台 Key。"""
+    other = {"id": 500, "key": "sk-admin-visible", "user_id": "user-2", "parent_id": None, "disabled": False}
+    fake = _FakeRows({500: other}, group_root_ids_for_caller=[])
+    _patch_db(monkeypatch, fake)
+    _patch_admin_role(monkeypatch, True)
+
+    row = await agent_api._resolve_caller_api_key(500, "admin-1")
+    assert row["id"] == 500
+    assert row["key"] == "sk-admin-visible"
+
+
+@pytest.mark.asyncio
+async def test_non_admin_still_denied_outside_own_scope(monkeypatch):
+    """普通用户越出用户域仍 403——放宽只对管理员生效。"""
+    other = {"id": 501, "key": "sk-other", "user_id": "user-2", "parent_id": None, "disabled": False}
+    fake = _FakeRows({501: other}, group_root_ids_for_caller=[])
+    _patch_db(monkeypatch, fake)
+    _patch_admin_role(monkeypatch, False)
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_api._resolve_caller_api_key(501, "user-1")
+    assert exc.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_admin_disabled_key_still_rejected(monkeypatch):
+    """管理员放宽取 Key，但 disabled 检查照样生效。"""
+    other = {"id": 502, "key": "sk-disabled", "user_id": "user-2", "parent_id": None, "disabled": True}
+    fake = _FakeRows({502: other}, group_root_ids_for_caller=[])
+    _patch_db(monkeypatch, fake)
+    _patch_admin_role(monkeypatch, True)
+
+    with pytest.raises(HTTPException) as exc:
+        await agent_api._resolve_caller_api_key(502, "admin-1")
+    assert exc.value.status_code == 403
+    assert "禁用" in exc.value.detail
+
+
+@pytest.mark.asyncio
+async def test_admin_own_key_skips_role_lookup(monkeypatch):
+    """管理员用自己的 Key 走原用户域路径，不应触发 role 查询（省一次 User 查询）。"""
+    own = {"id": 600, "key": "sk-own", "user_id": "admin-1", "parent_id": None, "disabled": False}
+    fake = _FakeRows({600: own}, group_root_ids_for_caller=[])
+    _patch_db(monkeypatch, fake)
+    called = {"n": 0}
+
+    async def _spy(caller):
+        called["n"] += 1
+        return True
+
+    monkeypatch.setattr(agent_api, "_caller_is_admin", _spy)
+
+    row = await agent_api._resolve_caller_api_key(600, "admin-1")
+    assert row["id"] == 600
+    assert called["n"] == 0

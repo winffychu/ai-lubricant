@@ -30,7 +30,7 @@ async def _fetch_repo_items(client: MarketplaceGitHub) -> list[tuple[str, dict]]
     from .validator import empty_index
 
     out: list[tuple[str, dict]] = []
-    modules = [*mp_config.settings.modules, "node-versions", "mobile-versions"]
+    modules = [*mp_config.settings.modules, "node-versions", "mobile-versions", "server-versions"]
     for module in dict.fromkeys(modules):
         try:
             got = await client.read_json_or_none(

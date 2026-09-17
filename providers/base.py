@@ -415,6 +415,32 @@ class BaseProvider(ABC):
             return aiohttp.ClientTimeout(total=None, sock_read=self.timeout_seconds)
         return None
 
+    def _stream_stall_timeout(self) -> float:
+        """流式请求的「停滞」上限（秒）：两次**有效事件**之间的最大间隔。
+
+        与 sock_read 的分工：sock_read 约束的是「两次 TCP 字节」的间隔，上游持续发
+        SSE 注释（``: ping`` / keep-alive）就能无限刷新它——2026-09-17 实证有候选
+        账号在建连后长时间只发注释、正文迟迟不来，sock_read=120 全程没触发，客户端
+        就一直干等（手机端表现为「发出去后一片空白」）。这里约束的是「两次真实事件」
+        （非纯注释）的间隔，keep-alive 刷不掉。
+
+        取 max(2×sock_read, 120s)：正常思考型模型可能几十秒不出正文，给足余量；
+        完全不配 timeout（timeout_seconds<=0）时用默认 300s，仍能兜住挂死。
+
+        可用环境变量 STREAM_STALL_TIMEOUT 覆盖（0 表示关闭该保护）。
+        """
+        raw = os.environ.get("STREAM_STALL_TIMEOUT", "").strip()
+        if raw:
+            try:
+                value = float(raw)
+            except ValueError:
+                value = -1.0
+            if value >= 0:
+                return value
+        if self.timeout_seconds and self.timeout_seconds > 0:
+            return float(max(self.timeout_seconds * 2, 120))
+        return 300.0
+
     def _stream_client_timeout(self) -> aiohttp.ClientTimeout:
         """复用的长连接 session 默认超时；具体单请求超时以 _stream_request_timeout 为准。"""
         t = self._stream_request_timeout()
@@ -1386,7 +1412,29 @@ class BaseProvider(ABC):
                     await self.record_router_response_body(message, {"router_response_body_callback": router_response_body_callback})
                     logger.debug(f"send sse request error, method={method}, url={url}, status={response.status}, body_len={len(body)}")
                     raise HTTPException(status_code=response.status, detail=message)
-                async for chunk in response.content.iter_any():
+                # 停滞看门狗：约束「两次有效事件」的间隔。上游只发 SSE 注释
+                # （keep-alive/ping）能无限刷新 sock_read，正文迟迟不来时客户端会一直
+                # 干等；这里按真实事件计时，超时就中止，让上层换下一个候选账号重试。
+                # 0 表示关闭（见 _stream_stall_timeout）。
+                stall_timeout = self._stream_stall_timeout()
+                last_event_at = time.monotonic()
+                aiter = response.content.iter_any()
+                while True:
+                    try:
+                        chunk = await asyncio.wait_for(
+                            aiter.__anext__(),
+                            timeout=None if stall_timeout <= 0 else stall_timeout,
+                        )
+                    except StopAsyncIteration:
+                        break
+                    except asyncio.TimeoutError:
+                        raise HTTPException(
+                            status_code=504,
+                            detail=(
+                                f"upstream stream stalled: no data for {stall_timeout:.0f}s "
+                                f"(url={url})"
+                            ),
+                        ) from None
                     # 第一时间记录上游原始内容，便于排查渠道卡死 / 半截断问题；
                     # 不等 SSE 解析、不等请求结束。
                     chunk_text = chunk.decode('utf-8', errors='replace')
@@ -1396,8 +1444,19 @@ class BaseProvider(ABC):
                     while b'\n\n' in buffer:
                         idx = buffer.find(b'\n\n')
                         event = buffer[:idx + 2].decode('utf-8')
+                        # 只有非纯注释事件才算「有进展」；keep-alive 注释不重置计时。
+                        if stall_timeout > 0 and not self.is_sse_comment_only(event):
+                            last_event_at = time.monotonic()
                         yield event
                         buffer = buffer[idx + 2:]
+                    if stall_timeout > 0 and (time.monotonic() - last_event_at) > stall_timeout:
+                        raise HTTPException(
+                            status_code=504,
+                            detail=(
+                                f"upstream stream stalled: no event for {stall_timeout:.0f}s "
+                                f"(keep-alive only, url={url})"
+                            ),
+                        )
                 if buffer:
                     decoded = buffer.decode('utf-8', errors='replace')
                     if decoded.strip():

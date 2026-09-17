@@ -2,6 +2,8 @@
 
 本文件是 Ai Lubricant **部署唯一权威文档**。历史 README 里的「Qwen 反向代理 / config.json」叙事已废弃，以本文件为准。
 
+生产裸跑（systemd）的版本升级见 [服务端一键升级](#服务端一键升级releases--current-布局)——管理端点一下即可拉代码、装依赖、切版本、重启，失败自动回切。
+
 ## 架构概览
 
 服务由**两个独立 Python 进程**组成，共用同一份 `.env`、同一套 PostgreSQL / Redis：
@@ -117,6 +119,104 @@ Linux 容器或 systemd，沿用形态 B 的配置方式（.env 指向生产 PG/
 - `node_credential_encryption_key` 一旦生成不得轮换，否则已加密节点凭据全部失效；建议在 .env 显式预置并在两进程同值。
 - `node_control_token` 两进程必须同值；`node_control_token` / `node_credential_encryption_key` / `agent_attachment_signing_key` 均须启动前手填非空（生成后不可更改，多实例必须同值）。
 - 数据服务前端产物需单独构建（见下），随镜像/部署包分发。
+
+## 服务端一键升级（releases + current 布局）
+
+生产裸跑（systemd）支持在管理端**点一下升级**：拉代码 → 装依赖 → 切版本 → 顺序重启 → 健康检查，失败自动回切。前端产物已随库发布（`publish_github.sh` 第 0.5 步构建 dist），部署机**不需要 Node 工具链**。
+
+Docker Compose 形态不走这条链路（镜像即版本，继续 `docker compose build && up -d`）。
+
+### 目录布局
+
+```
+/opt/ai-lubricant/
+├── releases/
+│   ├── v260909/          # 每个版本一份完整克隆（自带 venv/，含子模块与 dist）
+│   └── v260912/
+├── current -> releases/v260912   # 原子指针；翻转 = 升级提交点
+├── shared/               # 跨版本共享，不随旧 release 被 GC
+│   ├── .env              # 真身在此；每个 release 里软链它（附件签名 key 跨版本存续）
+│   ├── alb.env           # systemd EnvironmentFile：数据目录覆盖 + APP_VERSION
+│   ├── wait-health.sh    # 健康探针（服务单元 ExecStartPost 调用）
+│   ├── data/  attachments/  logs/  deleted_backups/  mc-tunnel-bins/
+└── /var/lib/alb/         # 升级状态目录（bootstrap 创建；web 进程与 updater 都读写）
+    ├── upgrade_target    # 升级标记文件（path unit 盯它）
+    └── upgrade_state.json # phase 状态机（管理端轮询）
+```
+
+服务单元默认以 root 运行（未设 `User=`），因此 web 进程对 `/var/lib/alb` 天然可写。若改为专用用户运行，需把该目录（及 `shared/`、`releases/`）chown 给该用户，并给 updater 单元 systemctl 权限。
+
+运行时数据全部经 `shared/alb.env` 指到 `shared/`（`GENERIC_AGENT_MEMORY_ROOT` / `GENERIC_AGENT_SOP_SOURCE_ROOT` / `AGENT_RESOURCE_STORE` / `ATTACHMENTS_ROOT` / `DELETED_BACKUPS_DIR` / `LOG_DIR` / `MC_TUNNEL_BIN_DIR`），所以 release 目录随升级 GC 不影响任何状态。
+
+### 一次性安装（部署机 root）
+
+前提：Linux + systemd + `git` + `python3`（含 venv 模块）+ `curl`。
+
+```bash
+# 把现有裸跑目录迁到 releases 布局（--source-dir 指现有代码根，用于迁移运行时数据）
+bash script/server_upgrade_bootstrap.sh \
+  --tag v260912 \
+  --repo-url https://github.com/wuxin-gh/ai-lubricant.git \
+  --source-dir /path/to/现有代码目录
+
+# 先看要做什么（不落盘、不装单元）
+bash script/server_upgrade_bootstrap.sh --tag v260912 --repo-url <url> --dry-run
+```
+
+脚本幂等，可重复跑。做四件事：建目录骨架 → 迁移运行时数据到 `shared/` → 生成 `shared/alb.env` → clone 首个 release + 建 venv + 翻指针 → 装并 enable 六个 systemd 单元。
+
+### 升级流程
+
+```
+管理端（市场管理 → 服务端）
+  ① 登记版本：选 git tag + 写备注（登记即门槛——publish 只是把 tag 推上 GitHub 当源料，
+     登记了才可见；draft 状态不推送给用户）
+  ② 点「升级到 vX」→ 确认
+       ↓
+web 进程（数据服务）
+  后台 git clone --branch vX（走平台代理池选定代理，只拉 node_server + user-frontend 两子模块）
+  → 拉完原子写 /var/lib/alb/upgrade_target
+       ↓
+宿主侧（systemd，root，独立 cgroup）
+  alb-upgrade.path 收到文件变更立即触发 alb-upgrade.service
+  （alb-upgrade.timer 每 30s 兜底——path 在 service 运行期间抑制不重复触发）
+       ↓
+server_updater.sh
+  认领标记(mv) → 校验 tag → 预检关键文件 → venv + pip install
+  → 翻 current 指针 → 写 APP_VERSION → 重启 alb-node → 等 :8003 健康
+  → 重启 alb-main + alb-tunnel → 健康验证 → 失败回切旧版 → GC（保留 current + 最近 2 版）
+```
+
+**为什么执行在宿主侧而不是 web 进程**：systemd 停服务会按 cgroup 杀掉该单元的全部后代，web 进程 spawn 的升级脚本会被一起杀死（checkout 做一半）。且 bash 边读边执行，脚本原件被替换后会读到乱字节。宿主侧独立进程两者都规避。
+
+### 断电安全
+
+| 断电时机 | 结果 |
+|---|---|
+| clone 中 / venv+pip 中 | `current` 仍在旧版，开机起完整旧版（新 release 是半成品，下次升级自动清理重建） |
+| 翻指针后、重启前 | 开机起完整新版（venv 已装毕） |
+| 翻指针后、`APP_VERSION` 未写 | 自愈分支（`target == current`）补写 env + 重启收敛 |
+
+### 回滚
+
+管理端对**已登记的旧版本**再点一次升级即可（流程完全复用，updater 切回旧 tag + 重启）。`server_updater.sh` 的健康验证失败也会自动回切。
+
+### 运维
+
+```bash
+# 查看状态
+systemctl status alb-node alb-main alb-tunnel
+systemctl list-timers alb-upgrade.timer
+curl -s http://127.0.0.1:8001/api/v1/server/config | grep current_version
+
+# 升级日志（管理端「复制日志路径」按钮也是这个）
+tail -f /opt/ai-lubricant/shared/logs/upgrade.log
+
+# 预检（不认领标记、不装依赖、不重启）
+DRY_RUN=1 bash /opt/ai-lubricant/current/script/server_updater.sh
+```
+
+可覆盖的环境变量：`SERVER_RELEASES_DIR` / `SERVER_CURRENT_LINK` / `SERVER_SHARED_DIR` / `SERVER_UPGRADE_STATE_DIR` / `SERVER_UPGRADE_REPO_URL` / `ALB_{NODE,MAIN,TUNNEL}_SERVICE` / `ALB_{MAIN,NODE,TUNNEL}_PORT` / `PIP_INDEX_URL` / `SERVER_UPGRADE_HEALTH_TIMEOUT`。
 
 ## 形态 D / E / F：无 Docker 原生启动
 

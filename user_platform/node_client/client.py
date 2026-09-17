@@ -32,8 +32,19 @@ from .normalization import (
 _MAX_UPLOAD_CHUNK_BYTES = 1024 * 1024
 _MAX_UPLOAD_TOTAL_BYTES = 10 * 1024 * 1024
 # Control-plane long operations wait for a node ack after a download/extract or
-# npm install. Keep this aligned with node_server.service.EDITOR_ACK_TIMEOUT.
-NODE_LONG_RPC_TIMEOUT = 620.0
+# npm install. This must sit STRICTLY ABOVE the control plane's worst-case
+# window: the unified UpgradeNode drives RuntimeUpgrade then SelfUpgrade
+# sequentially inside one request, so its budget is the SUM
+# (node_server.service.UPGRADE_TOTAL_ACK_BUDGET = 900 + 60 = 960s), not the
+# larger of the two. If this outer timeout fires first, the caller sees a bogus
+# 503 while the node is still working and the inner window is never reached.
+NODE_LONG_RPC_TIMEOUT = 1020.0
+# HostExec: the node runs the command under the request's own timeout_ms
+# (default 2 min, hard cap 10 min). Mirror the control plane's derivation so a
+# legitimate multi-minute command is not cut off by the 30s global default.
+NODE_HOST_EXEC_DEFAULT_TIMEOUT_MS = 2 * 60 * 1000
+NODE_HOST_EXEC_MAX_TIMEOUT_MS = 10 * 60 * 1000
+NODE_HOST_EXEC_SLACK = 60.0
 
 
 class NodeClient:
@@ -95,7 +106,8 @@ class NodeClient:
         import aiohttp
 
         url = f"{self._base_url}/agentcompose.v2.NodeService/{method}"
-        timeout = aiohttp.ClientTimeout(total=timeout or self._timeout)
+        total_seconds = float(timeout or self._timeout)
+        timeout = aiohttp.ClientTimeout(total=total_seconds)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=msg or {}, headers=self._headers()) as resp:
@@ -118,7 +130,11 @@ class NodeClient:
         except (NodeServerUnavailable, RPCError):
             raise
         except Exception as exc:  # noqa: BLE001
-            raise NodeServerUnavailable(f"控制面 {method} 不可用: {exc}") from exc
+            # asyncio/aiohttp 超时异常的 str() 是空串，直接 f-string 会拼出
+            # 「控制面 UpgradeNode 不可用: 」这种裸冒号，运维无法判断是超时还是
+            # 拒绝连接。这里给无消息异常补上类型名 + 本次调用超时值。
+            detail = str(exc) or f"{type(exc).__name__}（{total_seconds:.0f}s 内未返回）"
+            raise NodeServerUnavailable(f"控制面 {method} 不可用: {detail}") from exc
 
     # ── management plane ────────────────────────────────────────────────────
     async def list_nodes(self, status: str | None = None) -> list[dict[str, Any]]:
@@ -551,10 +567,20 @@ class NodeClient:
         return await self._rpc("CancelNodeBuild", {"nodeId": node_id, "buildId": build_id})
 
     async def self_upgrade_node(self, node_id: str, *, target: dict | None = None) -> dict[str, Any]:
-        return await self._rpc("SelfUpgradeNode", {"nodeId": node_id, "target": target})
+        # 节点下载 ~30MB 归档 + 解压 + 探测可能数分钟；控制面 ack 窗口 60s
+        # （SELF_UPGRADE_ACK_TIMEOUT），数据面调用必须覆盖这个窗口，否则 30s
+        # 全局超时会先掐断 → 503「不可用」假象。与 install_host_tool 同口径。
+        return await self._rpc(
+            "SelfUpgradeNode", {"nodeId": node_id, "target": target},
+            timeout=NODE_LONG_RPC_TIMEOUT,
+        )
 
     async def runtime_upgrade_node(self, node_id: str, *, target: dict | None = None) -> dict[str, Any]:
-        return await self._rpc("RuntimeUpgradeNode", {"nodeId": node_id, "target": target})
+        # 同 self_upgrade_node：覆盖控制面 60s ack 窗口。
+        return await self._rpc(
+            "RuntimeUpgradeNode", {"nodeId": node_id, "target": target},
+            timeout=NODE_LONG_RPC_TIMEOUT,
+        )
 
     async def upgrade_node(
         self,
@@ -563,6 +589,8 @@ class NodeClient:
         runtime_target: dict | None = None,
         node_target: dict | None = None,
     ) -> dict[str, Any]:
+        # 统一升级=RuntimeUpgrade 再 SelfUpgrade 两步串行，每步 ack 窗口 60s，
+        # 最坏 120s；用长超时覆盖，避免全局 30s 先掐断报假 503（裸冒号空异常）。
         return await self._rpc(
             "UpgradeNode",
             {
@@ -570,6 +598,7 @@ class NodeClient:
                 "runtimeTarget": runtime_target,
                 "nodeTarget": node_target,
             },
+            timeout=NODE_LONG_RPC_TIMEOUT,
         )
 
     # ── dispatch plane ──────────────────────────────────────────────────────
@@ -726,11 +755,20 @@ class NodeClient:
         timeout_ms: int = 0,
         max_output_bytes: int = 0,
     ) -> dict[str, Any]:
-        return await self._rpc("HostExec", {
-            "nodeId": node_id, "command": command, "cwd": cwd,
-            "timeoutMs": max(int(timeout_ms or 0), 0),
-            "maxOutputBytes": max(int(max_output_bytes or 0), 0),
-        })
+        # 节点按请求自带的 timeout_ms 执行（默认 2 分钟、硬顶 10 分钟），
+        # 数据面超时必须覆盖该预算 + 往返余量，否则长命令会被 30s 全局默认
+        # 掐断（节点还在跑），报假 503。与 install_host_tool 同口径。
+        budget_ms = max(int(timeout_ms or 0), 0) or NODE_HOST_EXEC_DEFAULT_TIMEOUT_MS
+        budget_ms = min(budget_ms, NODE_HOST_EXEC_MAX_TIMEOUT_MS)
+        return await self._rpc(
+            "HostExec",
+            {
+                "nodeId": node_id, "command": command, "cwd": cwd,
+                "timeoutMs": max(int(timeout_ms or 0), 0),
+                "maxOutputBytes": max(int(max_output_bytes or 0), 0),
+            },
+            timeout=budget_ms / 1000.0 + NODE_HOST_EXEC_SLACK,
+        )
 
     async def start_tool_run(
         self,

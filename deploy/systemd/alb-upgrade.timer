@@ -1,0 +1,15 @@
+# alb-upgrade.timer —— 兜底轮询（30s）
+#
+# 存在的结构性理由：.path 触发的 service 运行期间，path unit 处于抑制状态不再
+# 触发——升级那几分钟里管理员再写入的新请求，只能靠这里兜走。另外 .path 本身
+# 挂掉/未 enable 时，timer 是唯一的自动保险。
+[Unit]
+Description=服务端升级标记兜底轮询（30s）
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=30s
+Unit=alb-upgrade.service
+
+[Install]
+WantedBy=timers.target

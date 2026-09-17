@@ -11,6 +11,10 @@ import main
 from user_platform import routes_editors
 
 
+async def _async_audit(*_args, **_kwargs):
+    return None
+
+
 EDITOR = {"id": "ed_test", "provider": "codex", "status": "active"}
 API_KEY = {
     "id": 41,
@@ -389,3 +393,101 @@ async def test_switch_editor_session_model_pushes_llm_then_persists(monkeypatch)
     # next turn (the node stamps the new model onto the next human_message frame).
     assert calls[1] == ("persist", "es_active", "new-model")
     assert not any(call[0] == "restart" for call in calls)
+
+
+@pytest.mark.asyncio
+async def test_send_message_probes_runtime_and_reports_stale_handle(monkeypatch):
+    """A dead runtime handle must surface a conflict, not a silent accepted.
+
+    SendSessionInput is fire-and-forget at the control plane (it writes the
+    frame and returns accepted without waiting for the node), so without a probe
+    the editor message route used to return ``{"accepted": True}`` to a session
+    whose runtime was gone — the turn then vanished with nothing in the request
+    log and no error on the page. The probe now calls StartSessionRuntime first;
+    a NOT_FOUND raises 409 instead.
+    """
+    session = {
+        "id": "es_dead",
+        "editor_id": "ed_test",
+        "status": "active",
+        "node_session_id": "node-dead",
+    }
+    sends: list[tuple] = []
+
+    async def get_editor_for_user(editor_id, _user_id):
+        assert editor_id == "ed_test"
+        return {"id": "ed_test", "provider": "claude"}
+
+    async def get_editor_session(editor_id, session_id):
+        assert (editor_id, session_id) == ("ed_test", "es_dead")
+        return session
+
+    class NodeClient:
+        async def start_node_session_runtime(self, session_id):
+            assert session_id == "node-dead"
+            from user_platform.node_client import Code, RPCError
+            raise RPCError(Code.NOT_FOUND, f"session {session_id} is not placed on any node")
+
+        async def send_session_input(self, *args, **kwargs):
+            sends.append((args, kwargs))
+            return {"accepted": True}
+
+    monkeypatch.setattr(routes_editors.PostgresClient, "get_editor_for_user", get_editor_for_user)
+    monkeypatch.setattr(routes_editors.PostgresClient, "get_editor_session", get_editor_session)
+    monkeypatch.setattr(routes_editors, "get_local_node_client", lambda: NodeClient())
+    monkeypatch.setattr(routes_editors, "audit_user_action", _async_audit)
+
+    request = SimpleNamespace(url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8001"))
+    user = SimpleNamespace(id="user-1")
+    with pytest.raises(HTTPException) as exc:
+        await routes_editors.send_editor_session_message(
+            "ed_test", "es_dead",
+            routes_editors.SendSessionMessageReq(content="hello"),
+            request, user,
+        )
+    assert exc.value.status_code == 409
+    assert "运行时已失效" in exc.value.detail
+    # The message was never handed to SendSessionInput — no phantom accepted.
+    assert sends == []
+
+
+@pytest.mark.asyncio
+async def test_send_message_probes_then_sends_on_healthy_runtime(monkeypatch):
+    """A live runtime probe is a no-op; the message goes through as before."""
+    session = {
+        "id": "es_live", "editor_id": "ed_test", "status": "active",
+        "node_session_id": "node-live", "model": "gpt-x", "mode": "default",
+    }
+    started: list[str] = []
+    sent: list[dict] = []
+
+    async def get_editor_for_user(_editor_id, _user_id):
+        return {"id": "ed_test", "provider": "claude"}
+
+    async def get_editor_session(_editor_id, _session_id):
+        return session
+
+    class NodeClient:
+        async def start_node_session_runtime(self, session_id):
+            started.append(session_id)
+            return {"ok": True}
+
+        async def send_session_input(self, session_id, kind, text, *, model, mode):
+            sent.append({"session_id": session_id, "kind": kind, "text": text, "model": model, "mode": mode})
+            return {"accepted": True}
+
+    monkeypatch.setattr(routes_editors.PostgresClient, "get_editor_for_user", get_editor_for_user)
+    monkeypatch.setattr(routes_editors.PostgresClient, "get_editor_session", get_editor_session)
+    monkeypatch.setattr(routes_editors, "get_local_node_client", lambda: NodeClient())
+    monkeypatch.setattr(routes_editors, "audit_user_action", _async_audit)
+
+    request = SimpleNamespace(url=SimpleNamespace(scheme="http", netloc="127.0.0.1:8001"))
+    user = SimpleNamespace(id="user-1")
+    result = await routes_editors.send_editor_session_message(
+        "ed_test", "es_live",
+        routes_editors.SendSessionMessageReq(content="hello"),
+        request, user,
+    )
+    assert started == ["node-live"]
+    assert result["accepted"] is True
+    assert sent == [{"session_id": "node-live", "kind": "human_message", "text": "hello", "model": "gpt-x", "mode": "default"}]

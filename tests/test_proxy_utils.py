@@ -11,6 +11,7 @@ from proxy_utils import (
     resolve_account_proxy,
     resolve_account_url_prefix,
     runtime_accounts,
+    split_proxy_credentials,
 )
 from providers.base import apply_url_prefix
 from providers.custom import CustomProvider
@@ -59,6 +60,68 @@ def test_proxy_effective_url_is_none_for_direct_mode():
 def test_proxy_effective_url_network_injects_credentials():
     network = {"mode": "network", "url": "http://127.0.0.1:7890", "username": "u s", "password": "p@ss"}
     assert proxy_effective_url(network) == "http://u%20s:p%40ss@127.0.0.1:7890"
+
+
+# ──────────────── split_proxy_credentials ────────────────
+#
+# 与 proxy_effective_url 互为逆操作：那边把 username/password 拼进 URL，这边把用户
+# 粘进来的整行 scheme://user:pass@host:port 拆回结构化字段。前端两份实现
+# （user-frontend/src/utils/proxy-url.ts、mobile/src/utils/proxyUrl.ts）覆盖同一批边界。
+
+
+def test_split_proxy_credentials_extracts_userinfo():
+    assert split_proxy_credentials("http://u:p@127.0.0.1:7890") == ("http://127.0.0.1:7890", "u", "p")
+
+
+def test_split_proxy_credentials_decodes_percent_escapes():
+    assert split_proxy_credentials("http://u:p%40ss@h:7890") == ("http://h:7890", "u", "p@ss")
+
+
+def test_split_proxy_credentials_takes_last_at_so_password_may_contain_at():
+    # 密码里的 @ 不切错：userinfo 按最后一个 @ 切分。
+    assert split_proxy_credentials("http://u:p@ss@h:7890") == ("http://h:7890", "u", "p@ss")
+
+
+def test_split_proxy_credentials_username_only():
+    assert split_proxy_credentials("http://user@h:7890") == ("http://h:7890", "user", "")
+
+
+def test_split_proxy_credentials_empty_password_still_counts():
+    assert split_proxy_credentials("http://u:@h:7890") == ("http://h:7890", "u", "")
+
+
+def test_split_proxy_credentials_ipv6_host():
+    assert split_proxy_credentials("http://u:p@[::1]:1080") == ("http://[::1]:1080", "u", "p")
+
+
+def test_split_proxy_credentials_socks5_scheme_preserved():
+    # 不改 scheme 白名单：socks5 条目对节点下载链路有效，拆分只动 userinfo。
+    assert split_proxy_credentials("socks5://u:p@1.2.3.4:1080") == ("socks5://1.2.3.4:1080", "u", "p")
+
+
+def test_split_proxy_credentials_malformed_escape_does_not_raise():
+    # unquote 对畸形 % 宽容，原样返回而不抛。
+    assert split_proxy_credentials("http://u:p%zz@h:7890") == ("http://h:7890", "u", "p%zz")
+
+
+def test_split_proxy_credentials_keeps_path_query_fragment():
+    assert split_proxy_credentials("http://u:p@h:7890/path?x=1#f") == (
+        "http://h:7890/path?x=1#f", "u", "p",
+    )
+
+
+def test_split_proxy_credentials_no_userinfo_returns_unchanged():
+    for text in ("http://h:7890", "http://h:7890/", "127.0.0.1:7890", ""):
+        assert split_proxy_credentials(text) == (text, "", "")
+
+
+def test_split_proxy_credentials_userinfo_without_host_not_split():
+    # 只有 userinfo 没有主机：不是可用地址，原样返回让上层校验拦下。
+    assert split_proxy_credentials("http://u:p@") == ("http://u:p@", "", "")
+
+
+def test_split_proxy_credentials_empty_userinfo_yields_empty_credentials():
+    assert split_proxy_credentials("http://:@h:7890") == ("http://h:7890", "", "")
 
 
 # ──────────────── resolve_account_* ────────────────

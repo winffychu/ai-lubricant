@@ -47,10 +47,12 @@ class TaskRepoReq(BaseModel):
 class TaskExtraConfig(BaseModel):
     project_id: str | None = None
     issue_id: str | None = None
-    # 普通项传引用 id 字符串；技能集合传 {resource_id, entries:[子技能名…]}——
+    # 普通项传引用 id 字符串；集合传 {resource_id|reference_id, entries:[子技能名…]}——
     # resolve_reference_specs 按 entries 过滤，只下发勾选的子技能（缺省=全集合）。
+    # 两者形状一致（_resolve_task_resource_configs 用同一个循环处理），故都必须是
+    # list[Any]：写成 list[str] 会让集合绑定在 pydantic 校验阶段就 422。
     skill_ids: list[Any] | None = None
-    plugin_ids: list[str] | None = None
+    plugin_ids: list[Any] | None = None
 
 
 class VMResource(BaseModel):

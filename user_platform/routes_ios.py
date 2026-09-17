@@ -17,6 +17,8 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import Any
 
+from loguru import logger
+
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
@@ -133,34 +135,70 @@ def _load_apple_engine() -> Any:
     return SimpleNamespace(gsa=apple_gsa, developer=apple_developer, provision=apple_provision)
 
 
+# go-ios 内置的 DeviceKit runner 产物（cmd_device_ui_install.go:19
+# defaultDeviceKitArtifactURL）。`ios ui install devicekit` 就是从这里下的——
+# 市场没有发布 iOS 产物时回退到它，运维不必自己编译/上传 WDA ipa。
+#
+# 节点侧默认 bundle/xctest 与这份产物对齐（common/ioshost/wdapipeline.go 的
+# defaultDeviceKitBundleID / defaultDeviceKitXctest = com.deviceboxhq.goios.
+# devicekit.runner / devicekit-iosUITests.xctest），拿到即可签、可装。
+#
+# sha256 是钉死的：节点 Fetch 把 digest 当作「批准的产物」与「被替换的产物」之间
+# 唯一那道闸（wdapipeline.go: "Refuse rather than trust"），缺 digest 会直接拒装。
+# 值取自该 URL 的实际下载内容（2026-09-16 核验，8920427 字节），与运维本机用
+# `ios ui install devicekit` 下到的那份逐字节一致。
+_BUILTIN_DEVICEKIT_RUNNER_URL = "https://deviceboxhq.com/devicekit-ios-runner-0.0.18.ipa"
+_BUILTIN_DEVICEKIT_RUNNER_SHA256 = "45457d3f11de2b5370b14ba45e6c8502328e28825ee8222e8517245898a4c57f"
+_BUILTIN_DEVICEKIT_RUNNER_SIZE = 8920427
+_BUILTIN_DEVICEKIT_RUNNER_VERSION = "0.0.18"
+
+
 async def _resolve_market_wda_asset() -> dict:
-    """从市场 device-control iOS 发行版解析 WDA 产物（GitHub Release 直链 + sha256）。
+    """解析 WDA runner 产物（download_url + sha256）。
 
     prepare / renew / reinstall 都走这条：节点收到 artifact 后才下载校验
-    （artifact=None 会在节点侧 artifact_missing 即停）。市场产物由宿主节点
-    经自身出口代理下载。
+    （artifact=None 会在节点侧 artifact_missing 即停）。产物由宿主节点经自身
+    出口代理下载。
 
-    raises HTTPException(412) when the market has no iOS asset / no url+digest.
+    优先级：
+    1. **市场** device-control iOS 发行版——运营方上传了自己的签名产物/新版 runner
+       时用它（可覆盖 bundle、可自带 digest）。
+    2. **go-ios 内置的 DeviceKit runner**——市场为空时回退。这正是
+       `ios ui install devicekit` 用的那份，运维无需编译或上传任何东西。
+
+    市场为空不再 412：过去这会硬卡住「初始化」，而节点本来就具备从官方地址拉取、
+    自行签名安装的能力。
     """
     from server import device_control_release_catalog as dcrc
 
-    snapshot = await dcrc.get_latest_release()
-    asset = dcrc.select_asset(snapshot, "ios")
-    if asset is None:
-        raise HTTPException(
-            status_code=412,
-            detail="市场尚未发布 WDA iOS 产物（需运营方先在 device-control-versions 上传 iOS 包）",
-        )
-    digest = str(asset.get("digest") or "")
-    # 市场侧 digest 形如 "sha256:<hex>"，剥前缀给节点 Fetch 比对
-    sha256 = digest[7:] if digest.lower().startswith("sha256:") else digest
-    if not sha256 or not asset.get("download_url"):
-        raise HTTPException(status_code=412, detail="市场 iOS 产物缺少下载地址或校验值")
+    try:
+        snapshot = await dcrc.get_latest_release()
+    except Exception as exc:  # noqa: BLE001 — 市场不可用不该阻断内置回退
+        logger.warning("[ios-wda] market catalog unavailable, using builtin runner: {}", exc)
+        snapshot = {}
+
+    asset = dcrc.select_asset(snapshot or {}, "ios")
+    if asset is not None:
+        digest = str(asset.get("digest") or "")
+        # 市场侧 digest 形如 "sha256:<hex>"，剥前缀给节点 Fetch 比对
+        sha256 = digest[7:] if digest.lower().startswith("sha256:") else digest
+        if sha256 and asset.get("download_url"):
+            return {
+                "sha256": sha256,
+                "download_url": asset.get("download_url"),
+                "size_bytes": asset.get("size_bytes"),
+                "version": str(asset.get("version") or (snapshot or {}).get("version") or ""),
+                "source": "market",
+            }
+        # 市场有 iOS 条目但缺地址/校验值：同样退内置，而不是让初始化硬失败。
+        logger.warning("[ios-wda] market iOS asset incomplete (url/digest), using builtin runner")
+
     return {
-        "sha256": sha256,
-        "download_url": asset.get("download_url"),
-        "size_bytes": asset.get("size_bytes"),
-        "version": str(asset.get("version") or snapshot.get("version") or ""),
+        "sha256": _BUILTIN_DEVICEKIT_RUNNER_SHA256,
+        "download_url": _BUILTIN_DEVICEKIT_RUNNER_URL,
+        "size_bytes": _BUILTIN_DEVICEKIT_RUNNER_SIZE,
+        "version": _BUILTIN_DEVICEKIT_RUNNER_VERSION,
+        "source": "builtin-goios",
     }
 
 

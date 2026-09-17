@@ -2,6 +2,8 @@ import asyncio
 from types import SimpleNamespace
 
 import aiohttp
+import pytest
+from fastapi import HTTPException
 
 import providers.proxy_manager as pm
 from channel import Channel
@@ -159,3 +161,127 @@ def test_send_sse_request_without_timeout(monkeypatch):
     assert req_timeout is not None
     assert req_timeout.total is None
     assert req_timeout.sock_read is None
+
+
+# ---------------------------------------------------------------------------
+# 停滞看门狗：sock_read 只约束「两次字节」的间隔，上游持续发 SSE 注释就能无限刷新它。
+# 看门狗约束的是「两次有效事件」的间隔，keep-alive 刷不掉。
+# ---------------------------------------------------------------------------
+
+
+def _install_stalling_pm(monkeypatch, chunks, delay_after=None, delay=0.0):
+    """让 send_sse_request 收到给定分片；delay_after 指定在第 N 片后挂起（模拟上游停发）。"""
+
+    class StallingResponse(FakeResponse):
+        async def _iter_any(self):
+            for idx, chunk in enumerate(chunks):
+                yield chunk
+                if delay_after is not None and idx == delay_after:
+                    await asyncio.sleep(delay)
+
+    class StallingSession(FakeSession):
+        def request(self, method, url, **kwargs):
+            self.request_calls.append((method, url, kwargs))
+            return FakeReqCtx(StallingResponse())
+
+    class Factory:
+        def __init__(self):
+            self.sessions = []
+
+        def __call__(self, *args, **kwargs):
+            s = StallingSession(**kwargs)
+            self.sessions.append(s)
+            return s
+
+    factory = Factory()
+    monkeypatch.setattr(pm.aiohttp, "ClientSession", factory)
+    monkeypatch.setattr(pm, "make_insecure_connector", lambda *a, **k: None)
+    monkeypatch.setattr(pm, "_shared_manager", None)
+    return factory
+
+
+def test_stream_stall_timeout_defaults(monkeypatch):
+    """停滞上限：配了 timeout 取 max(2×, 120)；未配兜底 300；env 可覆盖/关闭。"""
+    monkeypatch.delenv("STREAM_STALL_TIMEOUT", raising=False)
+    assert DummyProvider("u", "p", timeout=45)._stream_stall_timeout() == 120.0
+    assert DummyProvider("u", "p", timeout=600)._stream_stall_timeout() == 1200.0
+    assert DummyProvider("u", "p")._stream_stall_timeout() == 300.0
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "0")
+    assert DummyProvider("u", "p", timeout=45)._stream_stall_timeout() == 0.0
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "7")
+    assert DummyProvider("u", "p", timeout=45)._stream_stall_timeout() == 7.0
+    # 非法值回落默认，不因环境变量写错而关掉保护
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "abc")
+    assert DummyProvider("u", "p", timeout=45)._stream_stall_timeout() == 120.0
+
+
+def test_stall_watchdog_raises_when_upstream_goes_silent(monkeypatch):
+    """上游发完一片就停发：看门狗必须在 stall 上限内抛 504，而不是无限干等。"""
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "0.05")
+    provider = DummyProvider("u", "p", timeout=45)
+    _install_stalling_pm(
+        monkeypatch,
+        [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'],
+        delay_after=0,
+        delay=5.0,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(_collect_events(provider))
+
+    assert excinfo.value.status_code == 504
+    assert "stalled" in str(excinfo.value.detail)
+
+
+def test_stall_watchdog_ignores_keepalive_comments(monkeypatch):
+    """上游只发 SSE 注释（keep-alive）也必须判停滞：注释不算「有进展」。
+
+    这正是 sock_read 挡不住的场景——注释持续到达会一直刷新 sock_read。
+    """
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "0.05")
+    provider = DummyProvider("u", "p", timeout=45)
+    _install_stalling_pm(
+        monkeypatch,
+        [b": ping\n\n", b": ping\n\n"],
+        delay_after=1,
+        delay=5.0,
+    )
+
+    with pytest.raises(HTTPException) as excinfo:
+        asyncio.run(_collect_events(provider))
+
+    assert excinfo.value.status_code == 504
+
+
+def test_stall_watchdog_allows_slow_but_progressing_stream(monkeypatch):
+    """正常慢流（事件持续到达、每片都远短于上限）不能被误杀。"""
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "1.0")
+    provider = DummyProvider("u", "p", timeout=45)
+    _install_stalling_pm(
+        monkeypatch,
+        [
+            b'data: {"choices":[{"delta":{"content":"a"}}]}\n\n',
+            b'data: {"choices":[{"delta":{"content":"b"}}]}\n\n',
+        ],
+        delay_after=None,
+    )
+
+    events = asyncio.run(_collect_events(provider))
+
+    assert len(events) == 2
+
+
+def test_stall_watchdog_disabled_by_zero(monkeypatch):
+    """STREAM_STALL_TIMEOUT=0 关闭看门狗：与旧行为一致，静默流不再被中止。"""
+    monkeypatch.setenv("STREAM_STALL_TIMEOUT", "0")
+    provider = DummyProvider("u", "p", timeout=45)
+    _install_stalling_pm(
+        monkeypatch,
+        [b'data: {"choices":[{"delta":{"content":"hi"}}]}\n\n'],
+        delay_after=0,
+        delay=0.2,
+    )
+
+    events = asyncio.run(_collect_events(provider))
+
+    assert len(events) == 1

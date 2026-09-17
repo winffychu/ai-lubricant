@@ -817,8 +817,15 @@ def test_begin_device_flow_global_waits_for_credential_paste(channel_cls):
     assert result["poll_params"]["region"] == "global"
     # 用户要先在官网登录才能拿到 localStorage，现在有完成路径了，返回它不再误导
     assert "autoclaw.z.ai" in result["auth_url"]
-    # 文案必须给出可照抄的动作：控制台命令 + 补投框提示
-    assert "localStorage" in result["message"]
+    # 文案必须给可照抄的动作：一句全浏览器可用的 JS（prompt 弹框，不是 copy()）+ 三步指引
+    msg = result["message"]
+    # 真形态：access token 只在 autoclaw.web.loginInfo 这个 JSON 字符串里（**没有**顶层
+    # autoclaw.web.accessToken 键），所以那句 JS 必须解 loginInfo 一起拼，只挑平铺键会漏 token
+    assert "prompt(" in msg
+    assert "loginInfo" in msg
+    assert "autoclaw.web." in msg
+    # copy() 只在 Chrome DevTools 控制台有，Firefox/地址栏/书签里会 ReferenceError，不能用
+    assert "copy(" not in msg
     assert result["replay_hint"] and result["replay_label"] and result["polling_hint"]
 
 
@@ -1100,6 +1107,71 @@ def test_credential_payload_drills_into_nested_json():
     assert doc["deviceId"] == "dev-s"
 
 
+def test_credential_payload_from_flat_namespaced_keys(channel_cls):
+    """AutoClaw 网页真形态：localStorage 平铺键 + 嵌套 JSON 字符串混排（实测 dump）。
+
+    关键点：**没有顶层 accessToken**——access token 藏在 ``autoclaw.web.loginInfo``
+    这个 JSON 字符串里；refreshToken/deviceId/userId 是顶层平铺键；还有键名里嵌 JWT 的
+    （``oauthNavigateUri.zai.<JWT>``）。识别必须**合并**各处字段，不能「找到第一个含
+    token 的对象就返回」（那样只会拿到 loginInfo、丢掉 deviceId，device_id 被自动重生成
+    会导致 refresh 续不上期）。
+    """
+    mod = _module()
+    payload = json.dumps({
+        "autoclaw.web.userId": "1487730d62f74187a181e8ad9859febd",
+        "autoclaw.web.oauthResult": json.dumps(
+            {"ok": True, "provider": "google", "msg": "登录成功", "id": "e8aa5fd1"}),
+        "autoclaw.web.runtimeSandboxId": "sb_23a6f18afe234c42b14c3be857498295",
+        "autoclaw.web.refreshToken": "Bearer rt-FLAT",
+        "autoclaw.web.oauthNavigateUri.zai.eyJ2IjoxLCJwIjoiemFpIn0.abc":
+            json.dumps({"navigateUri": "https://autoclaw.z.ai/web/?webOAuthCallback=zai"}),
+        "autoclaw.web.authToken": "Bearer auth-WEB",
+        "autoclaw.web.loginInfo": json.dumps({
+            "sub_id": "108", "user_id": "14877", "user_name": "wu xin",
+            "access_token": "Bearer at-LOGIN", "refresh_token": "Bearer rt-LOGIN"}),
+        "autoclaw.web.userInfo": json.dumps({
+            "id": 147417, "user_phone": "", "user_name": "wu xin",
+            "email": "wuxin1903@gmail.com", "config": {"vm_init": False}}),
+        "autoclaw.web.deviceId": "646d6b4c-96a4-4138-bd5b-3ba159fc836a",
+        "autoclaw.web.riskAgreementRead": "1",
+    })
+    doc = mod._credential_doc_from_payload(payload)
+    # access token 取自 loginInfo（STRICT 档）；authToken 是网页会话 token，不抢首选
+    assert doc["accessToken"] == "Bearer at-LOGIN"
+    # refreshToken/deviceId/userId 取自顶层平铺键（先到先得，平铺键是实时状态）
+    assert doc["refreshToken"] == "Bearer rt-FLAT"
+    assert doc["deviceId"] == "646d6b4c-96a4-4138-bd5b-3ba159fc836a"
+    assert doc["userId"] == "1487730d62f74187a181e8ad9859febd"
+    assert doc["userName"] == "wu xin"
+    # runtimeSandboxId 刻意不映射成 sandboxId（运行时沙箱 ≠ 持久沙箱，拼错 proxy base 全挂）
+    assert "sandboxId" not in doc
+    # 未识别的键（riskAgreementRead 等）不进凭证 doc
+    assert "riskAgreementRead" not in doc
+
+    # 端到端：合并出的 doc 真能建号，且 deviceId 用的是 dump 里的（refresh 才续得上期）
+    p = _make_provider(channel_cls, password="")
+    assert mod._apply_credential_doc(p, doc) is True
+    assert p.password == "Bearer at-LOGIN"
+    assert p.refresh_token == "Bearer rt-FLAT"
+    assert p.device_id == "646d6b4c-96a4-4138-bd5b-3ba159fc836a"
+    assert p.user_name == "wu xin"
+
+    # 包裹引号（控制台字符串回显形态 '{"..."}'）也要认
+    assert mod._credential_doc_from_payload("'" + payload + "'") == doc
+
+
+def test_credential_payload_auth_token_fallback(channel_cls):
+    """dump 里没有 loginInfo、只有 authToken → 兜底档补位，不至于建不出号。"""
+    mod = _module()
+    doc = mod._credential_doc_from_payload(json.dumps({
+        "autoclaw.web.authToken": "Bearer auth-ONLY",
+        "autoclaw.web.deviceId": "dev-2",
+    }))
+    assert doc["accessToken"] == "Bearer auth-ONLY"
+    assert doc["deviceId"] == "dev-2"
+
+
+
 def test_credential_payload_from_js_object_literals():
     """控制台直接复制对象（单引号/无引号键）不是合法 JSON → JS 字面量兜底。"""
     mod = _module()
@@ -1107,6 +1179,11 @@ def test_credential_payload_from_js_object_literals():
         "{accessToken: 'Bearer at-js', refreshToken: \"rt-js\", deviceId: 'dev-js'}")
     assert doc["accessToken"] == "Bearer at-js"
     assert doc["refreshToken"] == "rt-js"
+    # 带命名空间前缀的键名（控制台展开 localStorage 时常见）同样归一
+    doc = mod._credential_doc_from_payload(
+        "{autoclaw.web.accessToken: 'Bearer at-ns', autoclaw.web.deviceId: 'dev-ns'}")
+    assert doc["accessToken"] == "Bearer at-ns"
+    assert doc["deviceId"] == "dev-ns"
 
 
 def test_credential_payload_bare_token():

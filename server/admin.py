@@ -53,6 +53,7 @@ from proxy_utils import (
     resolve_account_proxy,
     resolve_account_proxy_config_id,
     resolve_account_url_prefix,
+    split_proxy_credentials,
     runtime_accounts,
 )
 from rate_limiter import ModelClientPool, AccountClient, AccountState, ProviderPool, NoAvailableAccountError
@@ -623,11 +624,11 @@ def _admin_validate_upstream_usage_payload(payload, had_content: bool = False) -
     if not zero_usage_payloads:
         return
 
-    # 有真实内容：删除零 usage，交给后续统计按内容估算兜底，语义对齐 main._validate_upstream_usage_payload。
+    # 有真实内容：不判失败。零的只是 completion 这一个分量，上游给的有效
+    # prompt/cached 原样保留，交给后续统计按内容逐分量估算补 completion，
+    # 语义对齐 main._validate_upstream_usage_payload——不能再整包 del usage，
+    # 否则有效 prompt 会被一起丢掉（见 usage-prompt-tokens-doubled.md）。
     if payload_has_content:
-        for data in zero_usage_payloads:
-            if "usage" in data:
-                del data["usage"]
         return
 
     raise HTTPException(status_code=502, detail=UPSTREAM_ZERO_COMPLETION_MESSAGE)
@@ -862,6 +863,13 @@ def _proxy_id(item: dict) -> str:
     # 使既有 proxy_id 与账号里存的 proxy_id 引用字节一致。
     owner = (item.get("owner_user_id") or "").strip()
     seed = f"{owner}|{item.get('name', '')}|{mode}|{disc}" if owner else f"{item.get('name', '')}|{mode}|{disc}"
+    # 凭据也入 seed：摘掉 url userinfo 后，同 host:port + 不同凭据的多条代理
+    # url 逐字节相同，不带 username 会被 _normalize_proxies 判「代理 ID 重复」
+    # 拒绝整批。无 username 时保持旧 seed 口径，id-less 历史条目不改号（见
+    # test_idless_entry_without_username_keeps_legacy_id）。
+    username_seed = (item.get("username") or "").strip()
+    if username_seed:
+        seed += f"|{username_seed}"
     return "proxy_" + hashlib.sha1(seed.encode("utf-8")).hexdigest()[:12]
 
 
@@ -899,12 +907,22 @@ def _normalize_proxy_item(item: dict) -> dict:
         url = url.rstrip("/")
         username, password = "", ""
     else:
-        username = (item.get("username") or "").strip()
-        password = item.get("password") or ""
+        # network 模式：用户可能把凭据整行粘进 url（scheme://user:pass@host:port）。
+        # 拆开存结构化的 username/password，url 只留 bare 地址——运行时再由
+        # proxy_effective_url 拼回去。显式传的 username/password 优先（编辑既有
+        # 条目、地址框是裸地址的场景），url 里的 userinfo 仅在没显式给时填回。
+        # 仅 network 拆：url_prefix 的基址不走认证，其 path 里若有 @ 不应被当
+        # 凭据摘掉（见 test_url_prefix_base_with_at_in_path_is_not_split）。
+        bare_url, url_user, url_pass = split_proxy_credentials(url)
+        url = bare_url
+        explicit_user = (item.get("username") or "").strip()
+        explicit_pass = item.get("password") or ""
+        username = explicit_user or url_user
+        password = explicit_pass or url_pass
     # 归属：原样保留。owner-less = 管理员/历史建（对所有人可用、非管理员不可见）。
     owner_user_id = (item.get("owner_user_id") or "").strip() or None
     result = {
-        "id": _proxy_id({**item, "name": name, "url": url, "mode": mode, "owner_user_id": owner_user_id}),
+        "id": _proxy_id({**item, "name": name, "url": url, "mode": mode, "owner_user_id": owner_user_id, "username": username, "password": password}),
         "name": name,
         "mode": mode,
         "url": url,

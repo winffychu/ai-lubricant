@@ -1,7 +1,7 @@
 """代理池配置到运行时代理 URL 的纯转换工具。"""
 from __future__ import annotations
 
-from urllib.parse import quote, urlsplit, urlunsplit
+from urllib.parse import quote, unquote, urlsplit, urlunsplit
 
 # 代理模式：network=传统 CONNECT/forward 网络代理（aiohttp proxy=）；
 # url_prefix=URL 前缀转发，把上游完整绝对 URL 拼到前缀后面（如 CF Workers 反代）；
@@ -41,6 +41,38 @@ def proxy_prefix_base(proxy: dict | None) -> str | None:
     if proxy_mode(proxy) != PROXY_MODE_URL_PREFIX:
         return None
     return canonical_url_prefix(proxy.get("url"))
+
+
+def split_proxy_credentials(url: str | None) -> tuple[str, str, str]:
+    """把代理地址里的 userinfo 拆出来，返回 ``(去认证的 url, username, password)``。
+
+    与 :func:`proxy_effective_url` 互为逆操作：那边把 username/password 拼进 URL，
+    这边把粘进来的整行 ``scheme://user:pass@host:port`` 拆回结构化字段。用户手上
+    的代理凭据几乎总是一行，拆开存库后运行时再拼回去，往返等价。
+
+    边界口径：
+    - netloc 里没有 ``@``、hostport 为空（``http://u:p@`` 这类畸形输入）、或
+      ``urlsplit`` 直接抛 ``ValueError`` → 原样返回 ``(url, "", "")``；
+    - userinfo 取**最后一个** ``@`` 切分，故密码里的 ``@``（``u:p@ss@h``）不会切错；
+    - ``unquote`` 对畸形 ``%`` 宽容（``p%zz`` 原样返回），无需 try；
+    - path/query/fragment 原样保留，不做任何规范化——url 参与 ``_proxy_id`` 哈希，
+      字节变化会牵动 id，故只动 userinfo 这一段。
+    """
+    text = str(url or "")
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return text, "", ""
+    netloc = parts.netloc
+    if "@" not in netloc:
+        return text, "", ""
+    userinfo, _, hostport = netloc.rpartition("@")
+    if not hostport:
+        # 只有 userinfo 没有主机：不是可用的代理地址，不拆（保留原样让上层报错）。
+        return text, "", ""
+    username, _, password = userinfo.partition(":")
+    bare = urlunsplit((parts.scheme, hostport, parts.path, parts.query, parts.fragment))
+    return bare, unquote(username), unquote(password)
 
 
 def proxy_effective_url(proxy: dict | None) -> str | None:

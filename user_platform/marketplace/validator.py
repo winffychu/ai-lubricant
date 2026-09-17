@@ -17,6 +17,9 @@ MARKET_INDEX_SCHEMA = "ai-lubricant.market.index.v1"
 MARKET_EXPORT_SCHEMA = "ai-lubricant.market.export.v1"
 
 _ITEM_ID_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+# git 标签允许的字符（``git check-ref-format`` 的子集）：升级时部署机把它交给
+# git checkout，放行空白/控制字符等于把 shell 注入面开进升级链路。
+_RELEASE_TAG_RE = re.compile(r"^[A-Za-z0-9._/-]+$")
 _DIGEST_RE = re.compile(r"^sha256:[a-fA-F0-9]{64}$")
 
 _MCP_TRANSPORTS = ("sse", "streamable-http")
@@ -38,6 +41,8 @@ _MOBILE_RELEASE_SCHEMA_LEGACY = "model-api.mobile-release/v1"
 # 设备控制 App 发行：与 mobile 同骨架但独立模块与 schema（被控端 vs 控制端）
 _DEVICE_CONTROL_VERSION_SCHEMA = "ai-lubricant.device-control-version/v1"
 _DEVICE_CONTROL_RELEASE_SCHEMA = "ai-lubricant.device-control-release/v1"
+# 服务端自身发行：无二进制资产（一版 = 一个 git tag），manifest 只记 tag/备注。
+_SERVER_VERSION_SCHEMA = "ai-lubricant.server-version/v1"
 _CHANNEL_TEMPLATE_SCHEMA = "ai-lubricant.channel-template/v1"
 _CHANNEL_TEMPLATE_SCHEMA_LEGACY = "model-api.channel-template/v1"
 _CHANNEL_ICON_KEYS = {
@@ -419,6 +424,17 @@ def _is_device_control_version(value: str) -> bool:
     return bool(_MOBILE_VERSION_RE.match(v) or _is_semver(v))
 
 
+def _is_server_version(value: str) -> bool:
+    """服务端发行版本号：接受 ``vYYMMDD`` 日期串（publish_github.sh 的 RELEASE_TAG
+    默认形态，可带前导 v）或宽松 semver。
+
+    日期串是发布脚本的既定口径（``RELEASE_TAG=v$(date +%y%m%d)``），字典序即时间序，
+    与三条客户端线的比较口径一致；semver 兼容手工指定的版本号。
+    """
+    v = (value or "").strip().lstrip("vV")
+    return bool(_MOBILE_VERSION_RE.match(v) or _is_semver(v))
+
+
 def identify_device_control_asset(filename: str) -> dict:
     """按命名规范识别设备控制 App 发行资产。
 
@@ -527,9 +543,13 @@ def validate_manifest(module: str, manifest: Any) -> list[str]:
         errors.append("display_name 必填")
     if not _text(manifest.get("version")):
         errors.append("version 必填")
-    # node-versions / mobile-versions / device-control-versions 用 version_notes 作为唯一版本说明，不再要求 summary。
+    # node-versions / mobile-versions / device-control-versions / server-versions 用
+    # version_notes 作为唯一版本说明，不再要求 summary。
     # channels 同样不要求：渠道没有真实说明时宁可贵留空，也不生成占位文案。
-    if module not in ("node-versions", "mobile-versions", "device-control-versions", "channels") and not _text(manifest.get("summary")):
+    if module not in (
+        "node-versions", "mobile-versions", "device-control-versions",
+        "server-versions", "channels",
+    ) and not _text(manifest.get("summary")):
         errors.append("summary 必填")
 
     resource = manifest.get("resource")
@@ -727,7 +747,40 @@ def validate_manifest(module: str, manifest: Any) -> list[str]:
         if forbidden:
             errors.append(f"设备控制 App 版本禁止携带敏感或本地字段: {forbidden}")
 
-    if module not in ("node-versions", "mobile-versions", "device-control-versions"):
+    elif module == "server-versions":
+        # 服务端版本与另三条线的本质差异：没有二进制资产。一版 = 一个 git tag，
+        # 部署机 clone 该 tag 即得全套代码（前端 dist 已随库发布）。因此这里校验
+        # 的是「tag 指向的发布物」，不是文件清单。
+        if manifest.get("kind") != "server_app_version":
+            errors.append('server-versions 模块的 kind 必须为 "server_app_version"')
+        if manifest.get("schema") != _SERVER_VERSION_SCHEMA:
+            errors.append(f'schema 必须为 "{_SERVER_VERSION_SCHEMA}"')
+        version = _text(manifest.get("version"))
+        if not version:
+            errors.append("version 必填")
+        elif not _is_server_version(version):
+            errors.append("version 必须是日期串（如 v260912 / 260912）或 semver")
+        if manifest.get("status") not in ("draft", "published"):
+            errors.append('status 必须为 "draft" 或 "published"')
+        if not _text(manifest.get("version_notes")):
+            errors.append("version_notes 必填")
+        # release_tag 是升级动作的实际输入（部署机 git checkout 它），必须显式给出
+        # 且与 version 同源——少了它升级链路无从下手，前端也不该靠 version 拼 tag。
+        release_tag = _text(manifest.get("release_tag"))
+        if not release_tag:
+            errors.append("release_tag 必填（升级时部署机 checkout 的 git 标签）")
+        elif not _RELEASE_TAG_RE.match(release_tag):
+            errors.append("release_tag 只能包含字母、数字、点、下划线、连字符和斜杠")
+        repo_url = _text(manifest.get("repo_url"))
+        if repo_url and not is_https_url(repo_url):
+            errors.append("repo_url 必须是 HTTPS URL")
+        forbidden = _find_forbidden_key(manifest)
+        if forbidden:
+            errors.append(f"服务端版本禁止携带敏感或本地字段: {forbidden}")
+
+    if module not in (
+        "node-versions", "mobile-versions", "device-control-versions", "server-versions"
+    ):
         digest = manifest.get("digest")
         if digest and not _DIGEST_RE.match(str(digest)):
             errors.append("digest 必须是 sha256: 加 64 位十六进制")
@@ -755,7 +808,9 @@ def index_summary(module: str, manifest: dict) -> dict:
     raw_id = str(manifest.get("id") or "")
     publisher = manifest.get("publisher") or raw_id.split(".")[0]
     summary = manifest.get("summary")
-    if module in ("node-versions", "mobile-versions", "device-control-versions") and not summary:
+    if module in (
+        "node-versions", "mobile-versions", "device-control-versions", "server-versions"
+    ) and not summary:
         notes = manifest.get("version_notes") or ""
         summary = (notes.strip().splitlines()[0] if notes.strip() else "")[:120]
     assets = manifest.get("assets") if module == "node-versions" else None

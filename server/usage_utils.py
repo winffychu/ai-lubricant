@@ -552,16 +552,14 @@ def content_to_text(content) -> str:
 
 
 def estimate_usage(request_body: dict | None, response_body: dict | None, model: str = "") -> dict:
+    # 输入口径不分协议：request_input_parts(..., "upstream") 读 body 里实际存在的
+    # 输入键（messages / input / instructions / system ...），同一份内容无论落在哪个
+    # 键上都估出同一个值。写死读 system/messages 会让 Responses 端点恒估出 0。
     prompt_text = ""
     if isinstance(request_body, dict):
-        prompt_text += content_to_text(request_body.get("system"))
-        for message in request_body.get("messages") or []:
-            if isinstance(message, dict):
-                prompt_text += "\n" + content_to_text(message.get("content"))
-                if message.get("tool_calls"):
-                    prompt_text += "\n" + json.dumps(message.get("tool_calls"), ensure_ascii=False)
-        if request_body.get("tools"):
-            prompt_text += "\n" + json.dumps(request_body.get("tools"), ensure_ascii=False)
+        for _, value in request_input_parts(request_body, "upstream"):
+            if value is not None:
+                prompt_text += "\n" + request_part_to_text(value)
 
     completion_text = ""
     if isinstance(response_body, dict):
@@ -765,11 +763,24 @@ def normalize_usage(usage: dict | None) -> dict:
     # 缓存 = 缓存读 + 缓存写（两者都属于输入 token）。
     cache_total = cached + cache_creation
 
+    # DeepSeek 风格分量对：prompt_cache_hit_tokens + prompt_cache_miss_tokens 恒等于
+    # prompt_tokens，即上游已把「总输入」按命中/未命中拆开给出，prompt_tokens 就是总输入。
+    # 用 key 是否命中判断（值为 0 也算存在），冷缓存全 miss 时同样成立。
+    has_deepseek_cache_split = (
+        _usage_value_with_key(source, "prompt_cache_hit_tokens")[1] is not None
+        and _usage_value_with_key(source, "prompt_cache_miss_tokens")[1] is not None
+    )
+
     if _input_field_is_total_input(input_key, cached_key, cache_creation_key):
         # 上游声称给了总输入（OpenAI 风格），缓存本应是这份输入里的明细子集。
-        # 但部分渠道把缓存从 input 里扣掉了：当 输入 <= 缓存 时，说明缓存并未计入
+        # 但部分渠道把缓存从 input 里扣掉了：当 输入 < 缓存 时，说明缓存并未计入
         # 该 input，需要把缓存加回，令 输入 = 缓存 + 输入。缓存为 0 时不触发。
-        if cache_total > 0 and input_val <= cache_total:
+        if has_deepseek_cache_split:
+            # 分量对是总输入的权威拆分，prompt_tokens 已是总输入，不能再加回。
+            prompt = input_val
+        elif cache_total > 0 and input_val < cache_total:
+            # 严格小于才是「缓存未计入」的证据。相等是「全部命中缓存」——
+            # 此时 input 已是总输入（解释 A），加回会把 prompt_tokens 精确翻倍。
             prompt = input_val + cache_total
         else:
             prompt = input_val

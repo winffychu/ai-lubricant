@@ -44,6 +44,7 @@ EVENT_CHANNEL_CATALOG = "channel_catalog"
 EVENT_NODE_RELEASE = "node_release"
 EVENT_MOBILE_RELEASE = "mobile_release"
 EVENT_DEVICE_CONTROL_RELEASE = "device_control_release"
+EVENT_SERVER_RELEASE = "server_release"
 EVENT_TOKENIZER_VOCAB = "tokenizer_vocab"
 
 # type -> handler(name: str | None, payload: dict)；name 可为实体名或 __all__/__default__ 哨兵

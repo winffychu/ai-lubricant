@@ -2458,22 +2458,50 @@ async def _resolve_caller_derived_key(api_key_id: int, caller: str) -> dict | No
     return None
 
 
+async def _caller_is_admin(caller: str) -> bool:
+    """C 端 session 调用者是否为平台管理员（``User.role == "admin"``）。
+
+    只做「是否放宽到全平台 Key」的判定：查不到 / 查询异常一律按**非**管理员处理，
+    失败时收紧而不是放宽。
+    """
+    try:
+        from user_platform.models import User
+
+        user = await User.get_or_none(id=caller)
+    except Exception:
+        return False
+    if user is None:
+        return False
+    return bool(
+        user.role == "admin"
+        and not getattr(user, "is_deleted", False)
+        and not getattr(user, "is_blocked", False)
+    )
+
+
 async def _resolve_caller_api_key(api_key_id: int, caller: str | None) -> dict:
     """按调用者解析 api_key_id → 含明文 key 的行；无权/不存在 → 403。
 
-    用户模式：依次检查个人 Key、分组系统根 Key，以及根 Key 对调用者已授权的
-    task/editor/copy 派生 Key。管理员模式按 id 直接取。
+    普通用户依次检查个人 Key、分组系统根 Key，以及根 Key 对调用者已授权的
+    task/editor/copy 派生 Key；以上都不命中且调用者是平台管理员（role==admin）时，
+    放宽到全平台任意 Key。caller=None（应急管理员 Bearer）本就没有用户域，直接
+    按 id 全平台取。
+
+    管理员判定放在用户域查找**之后**：管理员用自己的 Key 走原路径，不多付一次
+    User 查询；只有越出用户域时才查 role。
     """
     from db import PostgresClient
-    if caller is not None:
+    if caller is None:
+        # 应急管理员模式：按 id 直接取，不必全量 list_api_keys 再线性找。
+        row = await PostgresClient.get_api_key_by_id(api_key_id)
+    else:
         row = await PostgresClient.get_api_key_by_id_for_user(api_key_id, caller)
         if not row:
             row = await _resolve_group_system_key(api_key_id, caller)
         if not row:
             row = await _resolve_caller_derived_key(api_key_id, caller)
-    else:
-        # 管理员模式：按 id 直接取，不必全量 list_api_keys 再线性找。
-        row = await PostgresClient.get_api_key_by_id(api_key_id)
+        if not row and await _caller_is_admin(caller):
+            row = await PostgresClient.get_api_key_by_id(api_key_id)
     if not row or not row.get("key"):
         raise HTTPException(status_code=403, detail="无权使用该 API Key")
     if row.get("disabled"):

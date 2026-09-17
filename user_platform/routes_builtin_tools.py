@@ -270,7 +270,66 @@ async def list_devices_resource(user: User = Depends(get_current_user)) -> dict:
         node_id = str(info.get("node_id") or "")
         if node_id:
             resource["node_id"] = node_id
+
+    await _merge_ios_inventory(resources)
     return {"devices": resources}
+
+
+# iOS 设备状态字段：以**节点 inventory** 为准（设备自报，持久且随重连重放），
+# 而不是易失的 job 快照。前端据此渲染「初始化中 42% / 就绪 / 失败」，服务端重启
+# 后依然可见——这正是「初始化后台化」的关键。
+_IOS_INVENTORY_FIELDS = ("wda_state", "wda_progress", "wda_stage", "profile_expires_at", "last_error")
+
+
+async def _merge_ios_inventory(resources: list[dict]) -> None:
+    """把节点 inventory 的 WDA 状态合并进各 iOS 设备的 data.ios 块（就地改）。
+
+    按 node_id 分组，每节点只取一次 inventory（避免逐设备 N+1）。节点离线或查不到
+    时**保留资源里已有的值**——不能把上一次已知状态覆盖成空，否则界面会在节点抖动
+    时闪回「待初始化」。
+    """
+    from .node_client import get_node_client, NodeServerUnavailable, RPCError
+    from loguru import logger
+
+    # device_id -> resource，只挑 iOS 设备（有 ios 块）。
+    targets: dict[str, dict] = {}
+    by_node: dict[str, list[str]] = {}
+    for r in resources:
+        ios_block = r.get("ios") if isinstance(r.get("ios"), dict) else None
+        if not ios_block:
+            continue
+        node_id = str(ios_block.get("node_id") or r.get("node_id") or "").strip()
+        device_id = str(r.get("device_id") or "").strip()
+        if not node_id or not device_id:
+            continue
+        targets[device_id] = r
+        by_node.setdefault(node_id, []).append(device_id)
+
+    if not targets:
+        return
+
+    client = get_node_client()
+    for node_id, device_ids in by_node.items():
+        try:
+            inv = await client.get_ios_devices(node_id)
+        except (NodeServerUnavailable, RPCError) as exc:
+            # 节点不可达：保留资源里已有的 wda_state（上一次已知），只记日志。
+            logger.debug("[ios-devices] inventory unavailable for {}: {}", node_id, exc)
+            continue
+        for dev in inv.get("devices") or []:
+            resource = targets.get(str(dev.get("device_id") or "").strip())
+            if resource is None:
+                continue
+            ios_block = dict(resource.get("ios") or {})
+            for field in _IOS_INVENTORY_FIELDS:
+                if field not in dev:
+                    continue
+                value = dev.get(field)
+                # 空值不覆盖：节点刚重连、清单还没填全时，别把已知状态抹掉。
+                if value in (None, ""):
+                    continue
+                ios_block[field] = value
+            resource["ios"] = ios_block
 
 
 @router.post("/resources/device-pairing-codes")

@@ -28,7 +28,7 @@ from urllib.parse import urlparse
 from ..config import _resolve, _resolve_first
 from .source_config import DEFAULT_REPO_URL, get_source_config
 
-_DEFAULT_MODULES = ("mcp", "plugins", "skills", "channels", "prompts", "node-versions", "mobile-versions", "device-control-versions")
+_DEFAULT_MODULES = ("mcp", "plugins", "skills", "channels", "prompts", "node-versions", "mobile-versions", "device-control-versions", "server-versions")
 
 # 仓库名允许的字符（GitHub 规则），顺带剥掉结尾的 .git
 _REPO_NAME_RE = re.compile(r"^[A-Za-z0-9._-]+$")

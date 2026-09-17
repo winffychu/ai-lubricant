@@ -105,7 +105,9 @@ def _client() -> MarketplaceGitHub:
 # 发行模块（节点/移动端/设备控制 App 版本）是升级链路核心设施，不随内容模块白名单开关：
 # /consumer/version、/consumer/mobile-version、/consumer/device-control-version 与上传
 # 发布链路本就常驻可用，索引浏览（历史版本等）也不该因 modules 配置漏列而 400。
-_RELEASE_MODULES = frozenset({"node-versions", "mobile-versions", "device-control-versions"})
+_RELEASE_MODULES = frozenset(
+    {"node-versions", "mobile-versions", "device-control-versions", "server-versions"}
+)
 
 
 def _valid_module(module: str) -> bool:
@@ -2099,6 +2101,50 @@ async def retry_device_control_upload_job(job_id: str, _: User = Depends(_requir
         raise HTTPException(status_code=400, detail="没有可重试的失败文件")
     _start_device_control_github_transfer(job_id)
     return {"job_id": job_id, "retried": True}
+
+
+# ── 服务端自身升级链路（登记在「服务端」线，此处是检测/拉取/触发执行）─────────
+#
+# 登记复用通用 ``POST /admin/items``（module=server-versions，无文件上传，选 tag +
+# 备注）。本组端点只管：检测当前 vs 已登记最新、拉 GitHub tag 供登记下拉、确认
+# 升级后后台 clone 到 releases/<tag> 并原子写标记文件（由宿主 systemd path unit
+# 触发 updater 执行 pip/翻指针/重启/健康验证/回切）。
+
+@router.get("/admin/server-release")
+async def server_release_status(_: User = Depends(_require_admin)) -> dict:
+    """升级卡片所需全部状态：当前/最新/可否升级 + 进行中的 phase。永远不抛。"""
+    from user_platform import server_upgrade
+    return await server_upgrade.detect()
+
+
+@router.get("/admin/server-release/tags")
+async def server_release_tags(
+    proxy_config_id: str = "", _: User = Depends(_require_admin)
+) -> dict:
+    """拉 GitHub tag 列表供登记对话框下拉用（走平台代理池可选代理）。"""
+    from user_platform import server_upgrade
+    return await server_upgrade.list_release_tags(proxy_config_id=proxy_config_id)
+
+
+@router.post("/admin/server-release/upgrade")
+async def server_release_upgrade(
+    body: dict = Body(...), _: User = Depends(_require_admin)
+) -> dict:
+    """确认升级到指定已登记版本：后台 clone + 写标记，由 path unit 触发执行。
+
+    返回 ``{accepted}``——与节点升级同款语义；进度靠 ``GET /admin/server-release``
+    轮询 phase（cloning → clone_done → installing → restarting → verifying → done|failed）。
+    """
+    from user_platform import server_upgrade
+    target = str(body.get("target_tag") or body.get("release_tag") or "").strip()
+    proxy_config_id = str(body.get("proxy_config_id") or "").strip()
+    if not target:
+        raise HTTPException(status_code=400, detail="target_tag 必填")
+    result = await server_upgrade.start_upgrade(target_tag=target, proxy_config_id=proxy_config_id)
+    if not result.get("accepted"):
+        # 已有进行中 / 未登记 / 当前已运行 → 409 让前端区分
+        raise HTTPException(status_code=409, detail=result.get("error") or "无法开始升级")
+    return result
 
 
 @admin_router.post("/admin/items")

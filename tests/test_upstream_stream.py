@@ -220,13 +220,14 @@ def test_stream_content_detection_keeps_empty_dict_chunk_invalid():
 
 
 def test_validate_upstream_usage_skips_zero_completion_when_content_present():
-    # usage 与 content 同 payload：有内容 → 删 usage、不抛
+    # usage 与 content 同 payload：有内容 → 不抛，且保留上游给的有效 prompt 分量
+    # （只把不可靠的 completion 留给下游估算补，不再整包删 usage）。
     payload_with_content_and_zero_usage = {
         "choices": [{"message": {"content": "我把 CodeBuddy 的 UA/版本头补齐。"}}],
         "usage": {"prompt_tokens": 1, "completion_tokens": 0, "total_tokens": 1},
     }
     _validate_upstream_usage_payload(payload_with_content_and_zero_usage, stream=False)
-    assert "usage" not in payload_with_content_and_zero_usage
+    assert payload_with_content_and_zero_usage["usage"]["prompt_tokens"] == 1
 
     # usage 与 content 分属不同 chunk：同 attempt 累计已见过内容 → 不抛
     _validate_upstream_usage_payload(
@@ -235,7 +236,7 @@ def test_validate_upstream_usage_skips_zero_completion_when_content_present():
         had_content=True,
     )
 
-    # Anthropic 直通形态：content 为非空 list、usage output_tokens=0 → 不抛、删 usage
+    # Anthropic 直通形态：content 为非空 list、usage output_tokens=0 → 不抛、保留 input_tokens
     anthropic_payload = {
         "id": "msg_x",
         "type": "message",
@@ -243,7 +244,7 @@ def test_validate_upstream_usage_skips_zero_completion_when_content_present():
         "usage": {"input_tokens": 5, "output_tokens": 0},
     }
     _validate_upstream_usage_payload(anthropic_payload, stream=False)
-    assert "usage" not in anthropic_payload
+    assert anthropic_payload["usage"]["input_tokens"] == 5
 
 
 def test_validate_upstream_usage_fails_on_empty_response_with_zero_completion():

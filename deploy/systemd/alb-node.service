@@ -1,0 +1,26 @@
+# alb-node.service —— 节点控制面（先于主服务启动，切换铁律）
+#
+# WorkingDirectory=current 软链；ExecStart 用 current/venv/bin/python，每次
+# 重启都从当前 release 跑。EnvironmentFile=shared/alb.env 注入 APP_VERSION +
+# 运行时数据目录覆盖（GENERIC_AGENT_* / ATTACHMENTS_ROOT / LOG_DIR / 等）。
+#
+# PG/Redis 不在本 unit 的依赖里——部署形态各异（远端/本机 docker/systemd），
+# 应用层自带连接重试（db.py / redis 客户端）。如需顺序约束，本地改 After=/Wants=。
+[Unit]
+Description=Ai Lubricant 节点控制面
+After=network.target
+# 切换铁律：主服务依赖控制面先行，alb-main 的 After=alb-node.service 保证顺序
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/ai-lubricant/current
+EnvironmentFile=/opt/ai-lubricant/shared/alb.env
+ExecStart=/opt/ai-lubricant/current/venv/bin/python -m node_server
+Restart=on-failure
+RestartSec=5
+# 健康检查：control plane :8003/health。$${VAR:-default} 里的 $$ 是 systemd 转义
+# ——不写成 $$，systemd 会先按变量名 "NODE_CONTROL_PORT:-8003" 展开成空串。
+ExecStartPost=/opt/ai-lubricant/shared/wait-health.sh 8003 /health 120
+
+[Install]
+WantedBy=multi-user.target

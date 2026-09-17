@@ -45,6 +45,8 @@ x-app-build: &app-build
     context: .
     args:
       DOCKER_REGISTRY_PREFIX: "${DOCKER_REGISTRY_PREFIX:-}"
+      # 版本号烧进镜像 ENV APP_VERSION：与 TAG 同源，升级卡片/版本端点据此回答当前运行版本。
+      APP_VERSION: "${TAG:-local}"
 
 # app 服务共用的 DB/Redis 内网连接（指向 compose 内服务名，覆盖 env.ini/.env 里的默认）。
 x-db-env: &db-env

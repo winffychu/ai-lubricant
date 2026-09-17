@@ -127,6 +127,47 @@ async def test_resolve_folds_collection_dict_bindings_with_entries(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_resolve_folds_plugin_collection_dict_bindings_with_entries(monkeypatch):
+    """插件与技能走同一套绑定形状：plugin_ids 里的 {resource_id, entries} 也必须
+    原样下传。回归护栏——plugin_ids 曾误标成 list[str]，导致前端任何非空插件选择
+    在 pydantic 校验阶段就 422（skill_ids 是 list[Any] 所以没暴露）。"""
+    captured: list[dict] = []
+
+    async def fake_resolve(user_id, team_id, resource_type, bindings, *, request_base_url=""):
+        assert resource_type == "plugin"
+        captured.extend(bindings)
+        return [{"name": b.get("resource_id"), "source": "github"} for b in bindings]
+
+    monkeypatch.setattr(routes_task, "resolve_reference_specs", fake_resolve)
+    monkeypatch.setattr(routes_task, "resolve_team_id", _fake_team_id)
+
+    req = {"extra": {"plugin_ids": [
+        "pl-plain",
+        {"resource_id": "col-1", "entries": ["pdf", "slides"]},
+        {"reference_id": "ref-2"},
+    ]}}
+    patch = await routes_task._resolve_task_resource_configs(_user(), req, _request())
+    assert {"resource_id": "pl-plain"} in captured
+    assert {"resource_id": "col-1", "entries": ["pdf", "slides"]} in captured
+    assert {"reference_id": "ref-2"} in captured
+    assert len(patch["plugin_config"]) == 3
+
+
+def test_task_extra_config_accepts_dict_bindings_for_both_kinds():
+    """schema 层护栏：skill_ids 与 plugin_ids 必须同形状（list[Any]），否则集合
+    绑定在进路由逻辑之前就被 pydantic 拒掉。"""
+    req = routes_task.CreateTaskReq(
+        content="",
+        extra={
+            "skill_ids": [{"reference_id": "a", "entries": ["x"]}],
+            "plugin_ids": [{"reference_id": "b", "entries": ["y"]}, "plain"],
+        },
+    )
+    assert req.extra.skill_ids == [{"reference_id": "a", "entries": ["x"]}]
+    assert req.extra.plugin_ids == [{"reference_id": "b", "entries": ["y"]}, "plain"]
+
+
+@pytest.mark.asyncio
 async def test_resolve_routes_reference_id_bindings_to_new_store(monkeypatch):
     """{reference_id} 绑定路由到新表 resource_store（统一资源池）；旧 resource_id 走旧链路。"""
     import resource_store as rstore

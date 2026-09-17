@@ -168,6 +168,43 @@ def render_mobile_release(manifests: list[dict]) -> tuple[dict, list[str]]:
     return payload, errors
 
 
+def render_server_release(manifests: list[dict]) -> tuple[dict, list[str]]:
+    """服务端已登记版本的投影：返回 ``(payload, errors)``。
+
+    与另三条线的差异：**不写市场仓库文件**。服务端没有二进制资产要托管（一版 =
+    一个 git tag），升级链路读的是部署实例自己的内存快照（``server_release_catalog``），
+    而不是 GitHub raw。这个投影只供 publisher 在同进程内 ``apply_release`` 用。
+
+    取版本号最大的 published 条目——日期串 ``vYYMMDD`` 字典序即时间序，所以这里
+    用字符串比较（不能用 ``_version_sort_key``，那是 semver 口径，会把日期串压成
+    最小值）。草稿不参与：登记为 draft 即「发了但不推给用户」。
+    """
+    payload: dict = {
+        "version": "", "version_notes": "", "release_tag": "",
+        "repo_url": "", "updated_at": _now(),
+    }
+    best_manifest: dict | None = None
+    for manifest in manifests:
+        if not isinstance(manifest, dict):
+            continue
+        if manifest.get("status") != "published":
+            continue
+        version = str(manifest.get("version") or "")
+        if not version:
+            continue
+        if best_manifest is None or version > str(best_manifest.get("version") or ""):
+            best_manifest = manifest
+
+    if best_manifest is not None:
+        payload.update({
+            "version": str(best_manifest.get("version") or ""),
+            "version_notes": str(best_manifest.get("version_notes") or ""),
+            "release_tag": str(best_manifest.get("release_tag") or ""),
+            "repo_url": str(best_manifest.get("repo_url") or ""),
+        })
+    return payload, []
+
+
 def render_device_control_release(manifests: list[dict]) -> tuple[dict, list[str]]:
     """device-control-releases/version.json：返回 ``(payload, errors)``。
 

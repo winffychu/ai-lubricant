@@ -80,7 +80,7 @@ def _configure_file_logging() -> None:
         backtrace=True,
         diagnose=False,
     )
-from usage_utils import normalize_usage, usage_value, estimate_usage, set_tokenizer_rules_getter, estimate_request_part_tokens, estimate_request_part_tokens as _estimate_request_part_tokens, estimate_input_tokens, estimate_input_token_parts, request_input_parts, estimate_request_tokens
+from usage_utils import normalize_usage, usage_value, estimate_usage, fill_usage_with_estimate, set_tokenizer_rules_getter, estimate_request_part_tokens, estimate_request_part_tokens as _estimate_request_part_tokens, estimate_input_tokens, estimate_input_token_parts, request_input_parts, estimate_request_tokens
 from shared_init import init_shared_services
 from agent.config import AgentConfig
 from agent.runner import AgentTaskRunner
@@ -3230,8 +3230,13 @@ def _usage_value(usage: dict, *keys: str) -> int:
 def _usage(result: dict, request_body: dict | None = None, estimate: bool = True, model: str = "") -> dict:
     usage = result.get("usage") or {}
     normalized = normalize_usage(usage)
-    if normalized["prompt_tokens"] + normalized["completion_tokens"] + normalized["cached_tokens"] + normalized["cache_creation_tokens"] + normalized["reasoning_tokens"] <= 0 and estimate and request_body is not None:
-        return estimate_usage(request_body, result, model=model)
+    # 逐分量兜底：任一必需分量为 0 就按内容估算补齐（真实值优先，估算只补 0）。
+    # 不能用「各分量之和 <= 0」当闸门——只要另一个分量非零，为 0 的分量就永远补不上：
+    # 典型是上游给了有效 prompt_tokens 却报 completion=0，prompt 单独为 0 也同理。
+    if estimate and request_body is not None and (
+        normalized["prompt_tokens"] <= 0 or normalized["completion_tokens"] <= 0
+    ):
+        return fill_usage_with_estimate(normalized, estimate_usage(request_body, result, model=model))
     return normalized
 
 
@@ -3393,11 +3398,11 @@ def _validate_upstream_usage_payload(payload, stream: bool = False, had_content:
         return
 
     # 有真实内容时，零 completion usage 只是不可靠的上游统计，不能判失败。
-    # 删除顶层 usage，后续 _usage(..., estimate=True) / 流式估算会按内容兜底。
+    # 但零的只是 completion 这一个分量：上游给的有效 prompt/cached 必须原样保留，
+    # 下游 _usage(..., estimate=True) 会按内容逐分量把 completion 补回来。
+    # 这里整包 del usage 会把有效 prompt 一起丢掉，估算口径一旦读不到输入键，
+    # 有效 prompt 就被记成 0——见 usage-prompt-tokens-doubled.md 的姐妹问题。
     if payload_has_content:
-        for data in zero_usage_payloads:
-            if "usage" in data:
-                del data["usage"]
         return
 
     _raise_zero_completion_usage(stream)
