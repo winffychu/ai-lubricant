@@ -1,50 +1,61 @@
-# Overlay 构建：把上游源码**完全移出本仓库**，构建时再 clone。
+# 生产构建链路：clone 上游 → 打补丁 → 构建 → 推送 → 拉回冒烟
 #
-# ── 这个工作流要证明的命题 ────────────────────────────────────────────────
-#   「我们的仓库即便不保留任何上游源代码，也完全可以独立完成构建流程。」
+# ── 这个仓库是什么 ────────────────────────────────────────────────────────
+#   本仓库**不持有任何上游源代码**。它只是一份构建配方：
+#     * 本文件（构建/发布/验收流程）
+#     * .github/patches/（对上游源码的补丁，当前 0 个）
+#   构建上下文是工作流里**现场 clone 出来的上游目录**（$GITHUB_WORKSPACE/upstream-src）。
+#   本仓库只被 checkout 到 $GITHUB_WORKSPACE/overlay，仅用于提供补丁。
 #
-# 证明方式不是论述，而是**构造 + 断言**：
-#   1. 构建上下文是一个**全新 clone 出来的上游目录**（$GITHUB_WORKSPACE/upstream-src），
-#      本仓库只被 checkout 到 $GITHUB_WORKSPACE/overlay，仅用于提供 patches/。
-#   2. 断言构建上下文的 origin 指向上游、HEAD 等于本次解析出的上游 SHA。
-#   3. 断言 $CTX/.github **不存在** —— 上游的 .github/ 是空的，本仓库的 .github/ 里有
-#      5 个 workflow；一旦本仓库有任何文件泄漏进构建上下文，这个断言立刻失败。
-#      这是最直接的「零泄漏」探针。
-#   4. 零补丁时断言 `git -C $CTX status --porcelain` 为空 ⇒ 构建上下文与上游提交
-#      **逐字节相同** ⇒ 构建结果与「我们仓库里有没有源码」完全无关。
+# ── 为什么这样做 ──────────────────────────────────────────────────────────
+#   * 冲突面恒为零：本仓库不持有上游文件，就不存在 merge 冲突，也不需要"每周同步"
+#     这套机制（原先 sync-upstream.yml 那 328 行的 merge/冲突 issue/GH_REPO 防劫持/
+#     tag 回滚自愈逻辑全部消失）。
+#   * 子模块的相对 URL 自动正确：.gitmodules 写的是 `../ai-lubricant-*.git`，相对
+#     **origin** 解析。从上游 clone → wuxin-gh/ai-lubricant-*（存在）；从 fork clone
+#     → winffychu/ai-lubricant-*（不存在）。所以"改写子模块 URL"那个补丁自动消失。
+#   * 上游更新即生效：不需要同步、不存在"落后上游"这个状态。
 #
-# ── 为什么这条路比「fork 里放源码 + sed 打补丁」干净 ──────────────────────
-#   * 冲突面归零：本仓库不持有上游文件，就不存在 merge 冲突，也不需要每周
-#     `git merge --no-ff` + 冲突开 issue 的那套机制。
-#   * 子模块的相对 URL 自动正确：.gitmodules 写的是 `../ai-lubricant-*.git`，
-#     相对 **origin** 解析。从上游 clone → 解析成 wuxin-gh/ai-lubricant-*（存在）；
-#     从我们 fork clone → 解析成 winffychu/ai-lubricant-*（不存在）。
-#     也就是说，现有 docker-publish.yml / ci.yml / acceptance.yml 里那句
-#     `git config url."https://github.com/wuxin-gh/".insteadOf "https://github.com/winffychu/"`
-#     是个**纯粹由 fork 引入的补丁**，overlay 方式下自动消失。
-#   * 上游更新即生效：不需要同步、不需要合并、不存在"落后上游"这个状态。
+# ── 与旧链路的关系（已退役）──────────────────────────────────────────────
+#   本文件**取代**了原先的 4 条流水线：
+#     docker-publish.yml   → 本文件的 build job
+#     sync-upstream.yml    → 本文件的 schedule 触发（不再需要 merge，只需按上游最新构建）
+#     ci.yml               → 本文件的 run_tests（**仅在有补丁时自动启用**，见下）
+#     acceptance.yml       → 本文件的 verify job（矩阵覆盖 amd64 + arm64）
 #
-# ── 补丁机制 ──────────────────────────────────────────────────────────────
-#   本仓库对上游源码的任何改动都表达为 `.github/patches/*.patch`，按文件名排序依次
-#   `git apply`。**当前补丁数为 0** —— 因为我们已把与上游的差异收敛到「5 个纯新增的
-#   .github/ 文件、零上游文件修改」。所以今天这条流水线就是纯粹的
-#   「clone 上游 → 构建 → 推送」，补丁机制是留给将来的余量，不是现在的必需品。
-#   补丁应用失败即**硬失败**（不是警告）：宁可红，不可发出一个来源不明的镜像。
+# ── 测试门禁的取舍（重要）────────────────────────────────────────────────
+#   零补丁时**不跑**上游测试套件。理由：零补丁意味着镜像里的代码与上游提交**逐字节
+#   相同**，没有"我们的改动"需要验证；跑上游测试等于替上游背它的测试健康度，
+#   上游一旦有自己的红用例，我们的发布就会被卡住 —— 那正是"人工介入"的来源。
+#   真正的门禁是 verify job：镜像能构建、能起、/mcp/health 能答。
+#   一旦 patches/ 里有补丁（我们真的改了上游代码），测试套件**自动启用**。
 #
-# ── 与既有流水线的关系 ────────────────────────────────────────────────────
-#   本工作流是**新增**的并行通道，默认只推 `overlay-*` 标签，**不碰 `latest`**，
-#   因此不会影响现有生产链路。验收通过后，把下面 TAG_PREFIX 改为空并去掉
-#   `latest` 的隔离即可整体切换（同时退役 docker-publish.yml 并清掉仓库里的上游源码）。
+# ── 版本标识 ──────────────────────────────────────────────────────────────
+#   APP_VERSION = `upstream-<上游7hex>`（人工填 version 时用该值）。这是上游原生的
+#   版本标识（Dockerfile `ARG APP_VERSION` + `ENV`；compose 以 `APP_VERSION: "${TAG:-local}"`
+#   传它；lan_discovery.py 读它）。核验：docker exec <容器> printenv APP_VERSION
+#   镜像同时带 OCI 标注声明**上游**仓库与**上游**提交（org.opencontainers.image.source/revision）。
+#
+#   标签：`<上游7hex>`（钉版本用）+ `latest`（生产口径）。原先的 vYYMMDD.N 约定已取消
+#   —— 它需要读远端 tag 列表算序号，而那套机制只服务于"合并同步"这个已消失的场景。
+#   要精确回滚请用 digest：REF=sha256:<digest> bash upgrade_compose.sh
+#
+# ── 权限 ──────────────────────────────────────────────────────────────────
+#   Settings → Actions → General → Workflow permissions 需允许读写（packages: write）。
 
-name: Overlay Build (clone upstream → patch → build)
+name: Build & Publish (overlay)
 
 on:
+  # 每周一 02:17 UTC = 10:17 北京时间：按上游最新提交构建并发布。
+  # 这是"自动同步上游变更"在 overlay 模式下的等价物 —— 不是 merge，是重新构建。
+  schedule:
+    - cron: "17 2 * * 1"
   workflow_dispatch:
     inputs:
       upstream_ref:
-        description: "要构建的上游 ref（分支/tag/完整 SHA）。默认 main = 上游最新。"
+        description: "要构建的上游 ref（分支/tag/完整 SHA）。留空 = main。"
         required: false
-        default: "main"
+        default: ""
         type: string
       version:
         description: "可核验版本号（写进镜像 APP_VERSION）。留空 = upstream-<7hex>。"
@@ -57,12 +68,12 @@ on:
         default: true
         type: boolean
       run_tests:
-        description: "是否在构建前跑上游测试套件（有补丁时建议开启）。"
+        description: "强制跑上游测试套件（有补丁时会自动启用，无需勾选）。"
         required: false
         default: false
         type: boolean
 
-# 绝不并发：避免两次构建争抢同一批 overlay-* 标签。
+# 绝不并发、绝不取消在跑的一次：发布是原子操作，半途取消会留下不一致的状态。
 concurrency:
   group: overlay-build
   cancel-in-progress: false
@@ -78,30 +89,59 @@ env:
   IMAGE: ghcr.io/${{ github.repository }}
   CTX: ${{ github.workspace }}/upstream-src
   OVERLAY: ${{ github.workspace }}/overlay
-  # 隔离前缀：切换生产时置空。
-  TAG_PREFIX: "overlay-"
 
 jobs:
-  # ── 解析上游 SHA ──────────────────────────────────────────────────────────
-  # 单独一个 job 先把 SHA 定死，后续所有步骤都用这个 SHA，保证「日志里看到的
-  # SHA」与「真正被构建的 SHA」是同一个值。
+  # ── 解析上游 SHA 与本次运行的选项 ─────────────────────────────────────────
+  # 单独一个 job 先把 SHA 定死，后续所有步骤都用它，保证「日志里看到的 SHA」与
+  # 「真正被构建的 SHA」是同一个值。
+  # 选项也在这里归一化：schedule 触发时 inputs.* 全为空，必须显式给默认值，
+  # 否则 `push: ${{ inputs.publish }}` 会变成空串 → 定时构建永远不推送。
   resolve:
-    name: 解析上游提交
+    name: 解析上游提交与选项
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
       sha: ${{ steps.r.outputs.sha }}
       short: ${{ steps.r.outputs.short }}
+      ref: ${{ steps.r.outputs.ref }}
+      publish: ${{ steps.o.outputs.publish }}
+      run_tests: ${{ steps.o.outputs.run_tests }}
+      version: ${{ steps.o.outputs.version }}
     steps:
-      - name: 解析 ${{ inputs.upstream_ref }} 的提交 SHA
+      - name: 归一化运行选项（schedule 时 inputs 为空）
+        id: o
+        env:
+          EVENT: ${{ github.event_name }}
+          IN_REF: ${{ inputs.upstream_ref }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_PUBLISH: ${{ inputs.publish }}
+          IN_TESTS: ${{ inputs.run_tests }}
+        run: |
+          set -euo pipefail
+          ref="${IN_REF:-main}"
+          if [ "${EVENT}" = "workflow_dispatch" ]; then
+            publish="${IN_PUBLISH}"
+            tests="${IN_TESTS}"
+          else
+            # 定时/其它事件：发布，不强制跑测试（有补丁时 build job 会自动启用）。
+            publish="true"
+            tests="false"
+          fi
+          echo "ref=${ref}" >> "$GITHUB_OUTPUT"
+          echo "publish=${publish}" >> "$GITHUB_OUTPUT"
+          echo "run_tests=${tests}" >> "$GITHUB_OUTPUT"
+          echo "version=${IN_VERSION}" >> "$GITHUB_OUTPUT"
+          echo "事件=${EVENT}  ref=${ref}  publish=${publish}  run_tests=${tests}"
+
+      - name: 解析上游提交 SHA
         id: r
         env:
-          REF: ${{ inputs.upstream_ref }}
+          REF: ${{ steps.o.outputs.ref }}
         run: |
           set -euo pipefail
           # annotated tag 在 ls-remote 里会输出两行：tag 对象本身，以及以 ^{} 结尾的
           # 「解引用后的 commit」。必须优先取后者 —— 否则 sha 会是 tag 对象的 SHA，
-          # checkout 后 HEAD 与它不等，断言 3 直接失败（即：upstream_ref 传 tag 会挂）。
+          # checkout 后 HEAD 与它不等，断言会直接失败。
           out="$(git ls-remote "${UPSTREAM_URL}" "${REF}" || true)"
           sha="$(printf '%s\n' "${out}" | awk '/\^\{\}$/{print $1}' | head -1)"
           [ -n "${sha}" ] || sha="$(printf '%s\n' "${out}" | head -1 | cut -f1)"
@@ -123,12 +163,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 60
     outputs:
-      # verify 必须拉「本次构建真正推上去的那个标签」，不能自己再拼一遍：
-      # 迁移生产时 TAG_PREFIX 会被置空、tags 规则也会变，硬编码必然拉错。
       primary_tag: ${{ steps.ver.outputs.primary }}
       version: ${{ steps.ver.outputs.version }}
+      patched: ${{ steps.patch.outputs.count }}
 
-    # 仅 run_tests 时需要；services 会无条件起，成本可忽略。
+    # 仅 run_tests 需要；services 会无条件起，成本可忽略。
     services:
       postgres:
         image: postgres:16-alpine
@@ -158,37 +197,28 @@ jobs:
       REDIS_PORT: "6379"
 
     steps:
-      # 本仓库只用来提供 patches/。注意 checkout 到子目录 overlay/，
-      # 与构建上下文 upstream-src/ 完全分离。
+      # 本仓库只用来提供 patches/。checkout 到子目录 overlay/，与构建上下文完全分离。
       - name: Checkout 本仓库（仅取补丁）
         uses: actions/checkout@v4
         with:
           path: overlay
 
       # 关键：这里 clone 的是**上游**，不是我们自己的仓库。
-      # 不 --recurse-submodules：.dockerignore 只放行 node_server/ 与 user-frontend/，
-      # 其余 3 个子模块（nodes/mobile/device-control）不进构建上下文，不必下载。
-      # 相对 URL 会自然解析到 wuxin-gh/ai-lubricant-*，无需任何 insteadOf 改写。
+      # 用 init + fetch 而不是 `clone --branch`：上游 ref 可能是分支/tag/完整 SHA，
+      # fetch 三种都覆盖，`--branch` 只覆盖前两种。
+      # remote 必须叫 origin —— .gitmodules 的相对 URL 是相对 origin 解析的。
       - name: clone 上游到构建上下文
-        env:
-          REF: ${{ inputs.upstream_ref }}
         run: |
           set -euo pipefail
-          # 用 init + fetch 而不是 `clone --branch`：上游 ref 可能是分支/tag，也可能是
-          # 直接给的完整 SHA；fetch 能覆盖三种，`--branch` 只覆盖前两种。
-          # remote 必须叫 origin —— .gitmodules 的相对 URL（../ai-lubricant-*.git）
-          # 是相对 origin 解析的，名字错了子模块就拉不到。
           git init -q "${CTX}"
           git -C "${CTX}" remote add origin "${UPSTREAM_URL}"
           if ! git -C "${CTX}" fetch --depth 1 origin "${UPSTREAM_SHA}" 2>/dev/null; then
-            echo "· 按 SHA fetch 未成功，回退为按 ref '${REF}' fetch"
-            git -C "${CTX}" fetch --depth 1 origin "${REF}"
+            echo "· 按 SHA fetch 未成功，回退为按 ref fetch"
+            git -C "${CTX}" fetch --depth 1 origin "${{ needs.resolve.outputs.ref }}"
           fi
           git -C "${CTX}" checkout -q --detach FETCH_HEAD
-          # 全量子模块，不用白名单。理由：白名单（只拉 node_server / user-frontend）
-          # 是按当前 .dockerignore 挑的，上游一旦新增或放行某个子模块，白名单就会
-          # 悄悄漏掉构建所需的目录 —— 这种失败很难查。多拉三个浅克隆只多几秒，
-          # 换掉一整类脆弱性，划算。
+          # 全量子模块，不用白名单：白名单是按当前 .dockerignore 挑的，上游一旦新增
+          # 或放行某个子模块就会悄悄漏掉构建所需的目录 —— 这类失败很难查。
           # 相对 URL 会自然解析到 wuxin-gh/ai-lubricant-*，无需任何 insteadOf 改写。
           git -C "${CTX}" submodule update --init --recursive --depth 1
 
@@ -214,7 +244,7 @@ jobs:
           echo "count=${#patches[@]}" >> "$GITHUB_OUTPUT"
           echo "已应用 ${#patches[@]} 个补丁"
 
-      # ── 可行性论证的机器可验证部分 ────────────────────────────────────────
+      # ── 来源论证的机器可验证部分 ──────────────────────────────────────────
       - name: 断言构建上下文 100% 来自上游（零泄漏）
         run: |
           set -euo pipefail
@@ -229,11 +259,9 @@ jobs:
             || { echo "::error::构建上下文就是本仓库的检出，断言失败"; exit 1; }
 
           # 2) ★ 结构不变量：CTX 与 OVERLAY 必须互不包含。
-          #    两个方向都要查：
           #      - CTX 落在 OVERLAY 内部 → 上下文其实就是本仓库的一个子目录；
           #      - OVERLAY 落在 CTX 内部 → CTX 是工作区根，这正是 `context: .` 写错时
-          #        的形态（工作区里同时有 overlay/ 和 upstream-src/，两个都进上下文）。
-          #    只查第一个方向是不够的，第二种才是最容易犯的错。
+          #        的形态。只查第一个方向是不够的，第二种才是最容易犯的错。
           case "${CTX}" in
             "${OVERLAY}"|"${OVERLAY}"/*)
               echo "::error::CTX 位于本仓库检出内部"; exit 1 ;;
@@ -256,11 +284,9 @@ jobs:
           # 5) ★ 零泄漏探针：干净 clone 里不应存在任何**未跟踪文件**。
           #    为什么不去探测 `.github/` 是否存在：上游将来往 .github/ 加
           #    dependabot.yml / CODEOWNERS / 自带 workflow 是完全正常的，而且
-          #    .dockerignore 并没有排除 .github/ —— 那种情况下探测会**假阳性**，
-          #    把一条好端端的链路炸掉。
+          #    .dockerignore 并没有排除 .github/ —— 那种情况下探测会**假阳性**。
           #    正确的探针要跟"上游的目录布局"无关：本仓库的文件若混入上下文，
-          #    必然表现为未跟踪文件（不在上游那棵树里）。用 `ls-files --others`
-          #    不带 --exclude-standard，连被 .gitignore 忽略的文件也一并暴露。
+          #    必然表现为未跟踪文件。不带 --exclude-standard，连被忽略的也一并暴露。
           extra="$(git -C "${CTX}" ls-files --others)"
           if [ -n "${extra}" ]; then
             echo "::error::构建上下文里出现未跟踪文件 —— 本仓库的文件泄漏进了构建上下文"
@@ -298,7 +324,7 @@ jobs:
             echo "  本 job 依然产出完全相同的镜像。"
           } >> "$GITHUB_STEP_SUMMARY"
 
-      - name: 构建前置检查（Dockerfile / requirements.txt 存在）
+      - name: 构建前置检查
         run: |
           set -euo pipefail
           for f in Dockerfile requirements.txt .dockerignore .env.example; do
@@ -306,46 +332,51 @@ jobs:
           done
           echo "构建上下文文件数: $(find "${CTX}" -type f | wc -l)"
 
-      - name: 运行上游测试套件（可选）
-        if: inputs.run_tests
+      # 门禁：**仅在有补丁时自动启用**（见文件头"测试门禁的取舍"）。
+      - name: 运行上游测试套件（有补丁时自动启用）
+        if: needs.resolve.outputs.run_tests == 'true' || steps.patch.outputs.count != '0'
         run: |
           set -euo pipefail
           python -m pip install --upgrade pip
           pip install -r "${CTX}/requirements.txt"
           pip install "pytest==9.1.1" "pytest-asyncio==1.4.0" pytest-timeout
-          # 与 ci.yml 一致：这两个文件依赖 gitignored 的 specs/，全新 checkout 里不存在。
+          # 上游快照并非全绿，用 known-failures 列表显式 deselect（列表在本仓库里）。
+          DESELECT=""
+          if [ -f "${OVERLAY}/.github/pytest-known-failures.txt" ]; then
+            DESELECT=$(sed 's/^/--deselect=/' "${OVERLAY}/.github/pytest-known-failures.txt" | tr '\n' ' ')
+          fi
           cd "${CTX}"
+          # 这两个 --ignore 不是可有可无：它们依赖 specs/，而 specs/ 是上游仓库里
+          # 不存在的目录，收集阶段就会 FileNotFoundError。
           python -m pytest -q --timeout=300 --timeout-method=thread \
             --ignore=tests/test_eaichat_fence_json_aware.py \
-            --ignore=tests/test_eaichat_stream_fixtures.py
+            --ignore=tests/test_eaichat_stream_fixtures.py \
+            $DESELECT
 
       - name: Set up QEMU / Buildx
         uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
       - name: 登录 GHCR
-        if: inputs.publish
+        if: needs.resolve.outputs.publish == 'true'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
+          registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: 生成标签与版本号
         id: ver
         env:
-          INPUT_VERSION: ${{ inputs.version }}
+          INPUT_VERSION: ${{ needs.resolve.outputs.version }}
+          SHORT: ${{ needs.resolve.outputs.short }}
         run: |
           set -euo pipefail
-          if [ -n "${INPUT_VERSION}" ]; then
-            v="${INPUT_VERSION}"
-          else
-            v="upstream-${{ needs.resolve.outputs.short }}"
-          fi
-          echo "version=${v}" >> "$GITHUB_OUTPUT"
-          primary="${IMAGE}:${TAG_PREFIX}${{ needs.resolve.outputs.short }}"
-          tags="${primary},${IMAGE}:${TAG_PREFIX}latest"
+          if [ -n "${INPUT_VERSION}" ]; then v="${INPUT_VERSION}"; else v="upstream-${SHORT}"; fi
+          primary="${IMAGE}:${SHORT}"
+          tags="${primary},${IMAGE}:latest"
           if [ -n "${INPUT_VERSION}" ]; then tags="${tags},${IMAGE}:${INPUT_VERSION}"; fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
           echo "primary=${primary}" >> "$GITHUB_OUTPUT"
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "版本号 = ${v}"
@@ -358,10 +389,10 @@ jobs:
           # ★ 注意：context 指向上游 clone，**不是** `.`
           context: ${{ env.CTX }}
           file: ${{ env.CTX }}/Dockerfile
-          # 多架构镜像只能 push（daemon 存不下 manifest list），所以演练模式退化为单平台。
-          platforms: ${{ inputs.publish && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
-          push: ${{ inputs.publish }}
-          load: ${{ !inputs.publish }}
+          # 多架构镜像只能 push（daemon 存不下 manifest list），演练模式退化为单平台。
+          platforms: ${{ needs.resolve.outputs.publish == 'true' && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ needs.resolve.outputs.publish == 'true' }}
+          load: ${{ needs.resolve.outputs.publish != 'true' }}
           tags: ${{ steps.ver.outputs.tags }}
           build-args: |
             PIP_INDEX_URL=https://pypi.org/simple
@@ -390,21 +421,29 @@ jobs:
             echo "| 补丁数 | ${{ steps.patch.outputs.count }} |"
             echo "| 镜像 | \`${{ steps.ver.outputs.tags }}\` |"
             echo "| 版本号 | \`${{ steps.ver.outputs.version }}\` |"
-            echo "| 推送 | ${{ inputs.publish }} |"
+            echo "| 推送 | ${{ needs.resolve.outputs.publish }} |"
           } >> "$GITHUB_STEP_SUMMARY"
 
-  # ── 验收：把**刚推上去的**镜像拉回来真跑 ─────────────────────────────────
+  # ── 验收：把**刚推上去的**镜像拉回来真跑（amd64 + arm64 各一次）──────────
   # 这一步是「构建成功」与「镜像能用」之间的分界。只看 build 绿是不够的。
+  # 用矩阵覆盖两种架构：构建出 manifest list 不等于 arm64 那份真能跑。
   verify:
-    name: 拉取已发布镜像并冒烟
+    name: 拉取已发布镜像并冒烟 (${{ matrix.arch }})
     needs: [resolve, build]
-    if: inputs.publish
-    runs-on: ubuntu-latest
+    if: needs.resolve.outputs.publish == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 30
 
     env:
-      # 用 build job 实际推上去的主标签，不自己再拼一遍（迁移生产时 TAG_PREFIX
-      # 置空、标签规则变化，硬编码会拉到不存在或陈旧的镜像 → 假绿或误红）。
+      # 用 build job 实际推上去的主标签，不自己再拼一遍。
       REF: ${{ needs.build.outputs.primary_tag }}
 
     steps:
@@ -415,7 +454,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: 拉取刚发布的镜像（并记录 digest）
+      - name: 拉取刚发布的镜像（并记录 digest 与架构）
         run: |
           set -euo pipefail
           docker pull "${REF}"
@@ -423,6 +462,8 @@ jobs:
           echo "REF=${REF}" >> "$GITHUB_ENV"
           echo "DIGEST=${digest}" >> "$GITHUB_ENV"
           echo "拉取到 ${digest}"
+          echo "本 runner 架构 = $(docker version --format '{{.Server.Arch}}')"
+          docker image inspect "${REF}" --format '镜像架构 = {{.Architecture}}'
 
       # 只用上游的 .env.example 作为模板，不依赖本仓库的任何文件。
       - name: 取上游 .env.example（稀疏检出，只拉这一个文件）
@@ -496,7 +537,7 @@ jobs:
           curl -fsS http://localhost:3006/mcp/health; echo
           curl -fsS -o /dev/null -w 'GET /v1/models -> %{http_code}\n' http://localhost:3006/v1/models
 
-      - name: 核验镜像内版本标识（上游原生 APP_VERSION）
+      - name: 核验镜像内版本标识与来源标注
         run: |
           set -euo pipefail
           echo "镜像内 APP_VERSION = $(docker exec ai-lubricant printenv APP_VERSION)"
