@@ -70,7 +70,6 @@ skills-lock.json
 # probe_apple_gsa.sh 是 Apple ID 登录出口的诊断脚本（多机部署用），例外入库
 # native_launch.sh 是无 Docker 原生启动入口（见 native_deps/），例外入库
 # init_compose_env.py 在 docker compose 首次启动前生成跨容器共享密钥，例外入库
-# upgrade_compose.sh 是 compose 升级入口（pull/retag/--force-recreate/版本核验），例外入库
 # server_updater.sh / server_upgrade_bootstrap.sh 是一键升级链路的宿主侧执行器
 # 与部署机安装脚本（见 deploy/systemd/），例外入库
 script/*
@@ -78,7 +77,6 @@ script/*
 !script/probe_apple_gsa.sh
 !script/native_launch.sh
 !script/init_compose_env.py
-!script/upgrade_compose.sh
 !script/server_updater.sh
 !script/server_upgrade_bootstrap.sh
 scripts/
@@ -86,7 +84,6 @@ scripts/
 data/
 # 本地虚拟环境与 Cloudflare Pages 本地状态（可重建，不入库）
 .venv/
-.venv-ci/
 .wrangler/
 .claude_ch9.md
 .claude_chapter4.md
