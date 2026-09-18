@@ -134,7 +134,7 @@ docker compose --profile clickhouse up -d</code></pre>
 
 <h2 id="image">9. 替代方式：手动构建镜像</h2>
 <p>已有外部 PostgreSQL / Redis，或需要单独控制两个进程时才用这种方式；一般部署用上面的 Compose 即可。</p>
-<pre><code># 构建镜像（python:3.12-slim + requirements.txt）
+<pre><code># 构建镜像（python:3.11-slim + requirements.txt）
 docker build -t ai-lubricant-api .
 
 # 数据服务：外部 PG/Redis 地址用 -e 注入

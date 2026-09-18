@@ -110,8 +110,7 @@ docker compose up -d --force-recreate
 > ⚠ **`docker compose up -d` 单独用不会重建容器**：compose 判断是否重建看的是服务配置
 > 哈希（镜像引用串、env、volumes…），**不比对本地镜像 ID**。`docker tag` 只改了
 > `ai-lubricant:local` 这个名字背后的镜像 ID，配置哈希不变 → 容器不会重建，跑的还是
-> 旧镜像。**升级必须加 `--force-recreate`**，完整流程见
-> [DEPLOY.md 的「升级」章节](DEPLOY.md#升级已部署实例换新版本)。
+> 旧镜像。**升级必须加 `--force-recreate`**，完整流程见下一节。
 
 ### 方式 2：直接运行单进程（不用 compose）
 
@@ -125,7 +124,71 @@ docker run -d --name ai-lubricant \
 数据服务需可达 PostgreSQL / Redis（`--env-file` 中的 `POSTGRES_HOST` / `REDIS_HOST`
 指向它们），并保证 `.env` 中三个共享密钥已手填非空（见 [DEPLOY.md](DEPLOY.md) 形态 A）。
 
-## 四、发布到其他镜像仓库
+## 四、升级已部署实例（换新版本）
+
+> **为什么必须按本节做**：`docker compose up -d` **不会**重建容器。compose 判断是否重建
+> 看的是服务**配置哈希**（镜像引用串、env、volumes、ports…），**不比对本地镜像 ID**。
+> `docker tag` 只改变了 `ai-lubricant:local` 这个名字背后的镜像 ID，配置哈希没变
+> → 容器不重建 → **跑的还是旧镜像**（表现为"重新构建后发布的还是旧版本"）。
+> 因此升级必须显式加 `--force-recreate`。
+
+### 版本号从哪来
+
+镜像的权威发布路径是 GitHub Actions：
+
+```
+.github/workflows/sync-upstream.yml   每周同步上游；ci.yml 通过后在 GitHub 侧生成
+                                      vYYMMDD.N（如 v260917.1、v260917.2，当日序号递增）
+        ↓ push tag
+.github/workflows/docker-publish.yml  用该 tag 构建并推送镜像
+```
+
+- **版本 tag `vYYMMDD.N` 由 `sync-upstream.yml` 生成**，人工也可以直接推一个 `vYYMMDD.N`
+  tag，或在 Actions 页面用 `workflow_dispatch` 填 `version`。
+- 镜像内置 `AI_LUBRICANT_VERSION`，**这是核验"当前跑的是哪个版本"的唯一可靠手段**：
+  tag 驱动发布时等于版本 tag，分支推送（开发构建）时为 `main-<7hex>`。
+- 关于 fork 同步的三个事实（避免重复探索）：GitHub **没有**任何内置的"定时自动同步 fork"
+  能力（仓库页只有手动 Sync fork 按钮）；`POST /repos/{owner}/{repo}/merge-upstream`
+  **只支持快进**；本 fork 已分叉（比上游多出若干提交），因此该 API 与 Sync fork 按钮
+  **当前都不可用**。每周同步由 `sync-upstream.yml` 用 `git merge --no-ff` 完成。
+
+### 步骤
+
+```bash
+# 0. 选定目标版本（见上一节；也可用 gh run list 查看最近一次发布）
+VERSION=v260917.1
+
+# 1. 拉取目标版本镜像
+docker pull ghcr.io/<owner>/ai-lubricant:$VERSION
+
+# 2. 重新打成本地共享 tag（compose 的 ai-lubricant:${TAG:-local} 认这个名字）
+docker tag ghcr.io/<owner>/ai-lubricant:$VERSION ai-lubricant:local
+
+# 3. 强制重建容器（关键：不加 --force-recreate 容器不会重建）
+docker compose up -d --force-recreate
+
+# 4. 核验：容器内版本必须等于 $VERSION
+docker exec ai-lubricant printenv AI_LUBRICANT_VERSION
+```
+
+**第 4 步不等于 `$VERSION` 即视为升级失败**，回滚：
+
+```bash
+docker tag ghcr.io/<owner>/ai-lubricant:<上一个版本> ai-lubricant:local
+docker compose up -d --force-recreate
+```
+
+> 也可以直接用 `bash script/upgrade_compose.sh <VERSION>` 一步完成上面 4 步
+> （脚本只做 pull / tag / up --force-recreate / 版本核验，**不含任何 `docker build`**；
+> 核验不一致会退出非 0 并打印回滚命令）。
+
+### 反向验证（证明 `--force-recreate` 是必需的）
+
+在同一台机器上：旧版本在跑时，**跳过 `--force-recreate` 只执行 `docker compose up -d`**
+→ `docker exec ai-lubricant printenv AI_LUBRICANT_VERSION` **不变**（仍是旧版本）。
+这一步说明"镜像换了但容器没重建"，也是排查"还是旧版本"类问题的第一现场。
+
+## 五、发布到其他镜像仓库
 
 工作流默认发布 GHCR。如需发布到 Docker Hub / 阿里云 ACR / 自建 Harbor，在 workflow
 中把 `REGISTRY`、`images` 与登录步骤改为对应仓库即可，例如 Docker Hub：
@@ -139,7 +202,7 @@ env:
 
 推送国内仓库时，可同时把 `DOCKER_REGISTRY_PREFIX` 指向加速器前缀以加速基础镜像拉取。
 
-## 五、构建上下文与"非业务内容"清理
+## 六、构建上下文与"非业务内容"清理
 
 发布镜像只应包含运行时业务文件。`.dockerignore` 负责收敛上下文，已排除：
 

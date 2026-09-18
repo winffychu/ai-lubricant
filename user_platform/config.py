@@ -246,7 +246,7 @@ class UserPlatformSettings:
     # China-deployment mirror switch. Empty (default) = direct to upstream
     # (Docker Hub / npmjs). "cn" = route the Docker Hub base images and the
     # node editor-CLI npm installs through domestic mirrors, so a China deploy
-    # does not stall on python:3.12-slim / postgres / redis / npmjs.org.
+    # does not stall on python:3.11-slim / postgres / redis / npmjs.org.
     # Resolved into concrete addresses by ``mirror_settings()``.
     mirror_mode: str
 
@@ -267,7 +267,7 @@ class UserPlatformSettings:
             return {}
         return {
             # Prepended to a Docker Hub image ref. Trailing slash is included so
-            # ``f"{prefix}python:3.12-slim"`` reads naturally; a bare name like
+            # ``f"{prefix}python:3.11-slim"`` reads naturally; a bare name like
             # ``docker.1ms.run`` is normalized to carry the slash.
             "docker_registry_prefix": _normalize_registry_prefix(
                 _resolve("DOCKER_REGISTRY_PREFIX", "docker.1ms.run/")

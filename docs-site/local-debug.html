@@ -42,7 +42,7 @@
 <h2 id="prereq">1. 环境准备</h2>
 <div class="note"><strong>还没有代码？</strong>先完成部署文档的<a href="deploy.html#clone">「拉取代码与子模块」</a>一步——五个子模块必须显式拉取，否则前端和节点二进制都不在。</div>
 <ul>
-  <li>Python 3.12（推荐 venv）+ <code>requirements.txt</code> 依赖。这一份依赖同时覆盖三个 Python 进程，不需要分别装。</li>
+  <li>Python 3.11（推荐 venv）+ <code>requirements.txt</code> 依赖。这一份依赖同时覆盖三个 Python 进程，不需要分别装。</li>
   <li>PostgreSQL 与 Redis（本机、Docker 或远程均可）。Redis <strong>必须 ≥ 6.0</strong>：客户端强制 <code>HELLO 3</code> 握手，早期版本没有这个命令。</li>
   <li>前端：Node.js 18+ 与 <strong>pnpm</strong>（仓库锁文件是 <code>pnpm-lock.yaml</code>）。</li>
   <li>（可选）Go 工具链用于重新构建节点二进制；调试后端通常不需要。</li>
@@ -70,7 +70,7 @@ POSTGRES_DATABASE=ai-lubricant
 REDIS_HOST=127.0.0.1
 REDIS_PORT=6479
 REDIS_DB=0
-REDIS_PREFIX_KEY=ai_lubricant</code></pre>
+REDIS_PREFIX_KEY=marsview</code></pre>
 <div class="note"><strong><code>.env</code> 是扁平的 <code>KEY=VALUE</code>，没有 <code>[section]</code> 节头。</strong><code>.env.example</code> 里的 <code>#&nbsp;[postgres]</code> 只是分组注释。当前代码不解析任何 INI/JSON 配置文件——启动配置只有「环境变量 → <code>.env</code> → 内置默认值」三层，写成 <code>host = 127.0.0.1</code> 这种 INI 风格不会生效。</div>
 <div class="note"><strong>也可以直接用系统安装的服务</strong>在 macOS/Windows 上手动安装 PostgreSQL/Redis，然后把 <code>.env</code> 的 host/port 指过去（通常是默认的 5432/6379）。Docker Compose 只负责依赖，不负责前端和节点控制服务。</div>
 
