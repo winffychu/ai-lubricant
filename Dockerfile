@@ -33,12 +33,3 @@ EXPOSE 8001 8003 8004
 
 # 启动命令
 CMD ["python", "main.py"]
-
-# 可核验版本标识（本项目加固引入）：与上方 APP_VERSION 同源，同一个 build-arg 注入。
-#   tag 驱动发布（权威路径）→ 版本 tag，如 v260917.1
-#   人工发布填了 version input → 该值
-#   分支推送（开发构建）    → main-<7hex>
-# 运维核验：docker exec <容器> printenv AI_LUBRICANT_VERSION
-# 注：ARG APP_VERSION 已在 COPY 之后声明过（上游的升级链路也读它），此处只补一个语义更
-# 明确的 ENV 别名，不重复声明 ARG；版本号相关层都在 COPY 之后，不会击穿 pip/COPY 缓存。
-ENV AI_LUBRICANT_VERSION=${APP_VERSION}

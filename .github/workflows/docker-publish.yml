@@ -11,11 +11,14 @@
 #   - pull_request 到 main → 仅构建校验，不推送
 #   - workflow_dispatch    → 手动触发（可填 version 指定版本号，留空则自动推导）
 #
-# 版本可核验：镜像内置 AI_LUBRICANT_VERSION（Dockerfile 末尾的 ENV），
+# 版本可核验：镜像内置 APP_VERSION —— 这是**上游原生**的版本标识（Dockerfile 的
+#   `ARG APP_VERSION` + `ENV APP_VERSION`；docker-compose.yml 也以
+#   `APP_VERSION: "${TAG:-local}"` 传它，lan_discovery.py 读它）。本 fork **不引入
+#   额外别名**，直接用上游的 APP_VERSION。
 #   tag 推送 = 该 tag，人工 input = 该 input，分支推送 = main-<7hex>。
-#   核验：docker exec <容器> printenv AI_LUBRICANT_VERSION
+#   核验：docker exec <容器> printenv APP_VERSION
 #   权威发布路径是 .github/workflows/sync-upstream.yml（生成 vYYMMDD.N tag 后
-#   `gh workflow run docker-publish.yml --ref <tag>`），见 docs/DOCKER_IMAGE.md。
+#   `gh workflow run docker-publish.yml --ref <tag>`）。
 #
 # 注：vYYMMDD.N 只有两段，不是合法 semver，故 metadata-action 不配 type=semver
 #   （配了也永不命中，反而误导）。tag 规则里那条 type=raw 只在人工填了
@@ -93,8 +96,8 @@ jobs:
             type=raw,value=latest,enable=${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) || startsWith(github.ref, 'refs/tags/') }}
 
       # 可核验版本号：tag 推送 → 该 tag；人工填了 input → 该 input；其余（分支推送）
-      # → main-<7hex>。注入镜像的 AI_LUBRICANT_VERSION（见 Dockerfile 末尾），
-      # 运维用 `docker exec <容器> printenv AI_LUBRICANT_VERSION` 即可核验。
+      # → main-<7hex>。作为 build-arg APP_VERSION 传给 Dockerfile（上游原生参数），
+      # 运维用 `docker exec <容器> printenv APP_VERSION` 即可核验。
       # 注：vYYMMDD.N 不是合法 semver，故不配置 type=semver 规则（永不命中）。
       - name: 解析可核验版本号
         id: ver
@@ -109,7 +112,7 @@ jobs:
             v="main-${GITHUB_SHA::7}"
           fi
           echo "version=${v}" >> "$GITHUB_OUTPUT"
-          echo "AI_LUBRICANT_VERSION=${v}"
+          echo "APP_VERSION=${v}"
 
       - name: 构建并推送镜像
         uses: docker/build-push-action@v6
