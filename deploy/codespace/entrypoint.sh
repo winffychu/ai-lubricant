@@ -39,6 +39,4 @@ fi
 echo "[codespace] supervisord config: ${conf_path}"
 
 # ---- 前台运行 supervisord，托管全部 program ----
-# 建库已由上面的 supervisord-conf 完成（native_deps.lifecycle.ensure_databases：
-# 起 PG → 等就绪 → 按 POSTGRES_DATABASE 建库 → 停 PG，幂等），此处不再重复自举。
 exec supervisord -c "${conf_path}" -n

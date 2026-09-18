@@ -1,14 +1,8 @@
 #!/usr/bin/env bash
-# ⚠ 已非权威发布入口：权威发布路径是 GitHub Actions
-#   （.github/workflows/sync-upstream.yml → ci.yml → docker-publish.yml），
-#   版本 tag（vYYMMDD.N）由同步工作流在 GitHub 侧生成。
-#   本脚本仅用于「内网 Gitea → GitHub 公开快照」的内部/遗留流程，
-#   不参与、也不影响权威发布链路。
-#
 # publish_github.sh —— 一键发布：提交在途改动 → 推内网 Gitea → 造 GitHub 公开快照 → 推 6 仓 + 标签
 #
 # 这条命令做什么（全程不切分支、不碰工作树，多会话并行共享 worktree 时安全）：
-#   0. 预检：按 GH_PROXY 导出本次进程代理（不写任何 git 配置）；自愈老脚本残留（子仓卡在 public-snapshot 分支）。
+#   0. 预检：GitHub 代理自配；自愈老脚本残留（子仓卡在 public-snapshot 分支）。
 #   0.5 构建前端 dist 并随库发布（部署机一键升级从公开仓 clone，免构建部署）。
 #   1. 六仓（主仓+5 子仓）自动提交在途改动并推内网 origin；内网落后别机则报错退出。
 #   2. 每个子仓：用 HEAD 的树 + 上一次快照为父，git commit-tree 直接造新快照
@@ -23,8 +17,6 @@
 #   bash script/publish_github.sh
 # 环境变量：
 #   GH_BASE      GitHub 前缀（默认 https://github.com/wuxin-gh）
-#   GH_PROXY     可选：本次推送走的 HTTP 代理（如 http://<proxy-host>:<port>）。
-#                只对本次进程导出 HTTPS_PROXY/HTTP_PROXY，不写任何 git 配置文件。
 #   RELEASE_TAG  标签名（默认 v + 日期，如 v260909）
 #   NO_TAG=1     不打标签
 #   STRICT=1     不自动提交：任一仓工作树脏则报错退出（默认 0=自动提交）
@@ -96,21 +88,12 @@ ensure_remote() { # $1=仓库路径 $2=URL
   fi
 }
 
-# ensure_proxy：代理只作用于本次进程，绝不写入 git 配置文件。
-# 旧版本会执行 `git config --global http.https://github.com/.proxy ...`，把开发者本机
-# 代理固化进全局配置（非业务内容，且会污染用户机器）；现改为读 GH_PROXY 环境变量。
 ensure_proxy() {
-  # 旧脚本可能已在用户机器上留下全局 proxy 键。改用户全局配置属破坏性动作，
-  # 这里只提示、不自动删除。
-  if git config --global http.https://github.com/.proxy >/dev/null 2>&1; then
-    echo "· 检测到全局 git 配置 http.https://github.com/.proxy 已设置（旧脚本残留）。" >&2
-    echo "  如不需要，请手工执行：git config --global --unset http.https://github.com/.proxy" >&2
-  fi
-  if [ -n "${GH_PROXY:-}" ]; then
-    # git/libcurl 原生识别这两个变量，无需写任何配置文件。
-    export HTTPS_PROXY="${GH_PROXY}"
-    export HTTP_PROXY="${GH_PROXY}"
-    echo "· 本次推送经 GH_PROXY 走代理（仅本进程，未写入 git 配置）" >&2
+  local cur
+  cur="$(git config --global http.https://github.com/.proxy || true)"
+  if [ -z "$cur" ]; then
+    git config --global http.https://github.com/.proxy http://127.0.0.1:7890
+    echo "· 已设置 GitHub 专用代理 http://127.0.0.1:7890（仅 github.com 走代理）"
   fi
 }
 

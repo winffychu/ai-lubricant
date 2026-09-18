@@ -23,7 +23,6 @@ build/AiLubricant/
 
 # 本地工具目录（不进镜像）
 .venv/
-.venv-ci/
 .worktrees/
 .pytest_cache/
 .codegraph/
@@ -37,11 +36,6 @@ build/AiLubricant/
 .chrome-tmp/
 .playwright-mcp/
 .tmp-guard-test/
-
-# 开发过程残留（非业务文件，不进发布镜像）
-.stage2-server-progress.md
-.stage3-wda-job-progress.md
-.footer-verify.js
 
 # 运行时产物（无 git 跟踪内容，由 docker-compose 命名卷持久化，不烘焙进镜像）。
 # 注意 data/ 不排除：本地构建时 data/agent-resources 技能归档与 data/agents

@@ -15,7 +15,7 @@
 #
 # 目标：
 #   1. build-only（硬性门槛）：`docker build -f Dockerfile.codespace` 构建 linux/amd64
-#      成功，证明该形态在 python:3.12-slim 下依赖安装、apt 装 PG16/Redis、构建期
+#      成功，证明该形态在 python:3.11-slim 下依赖安装、apt 装 PG16/Redis、构建期
 #      provision（initdb）全链路可用；
 #   2. smoke（硬性门槛）：起单容器并轮询 http://localhost:7860/ 与 /mcp/health，
 #      验证 supervisord 能把 PG + Redis + node-server + main + tunnel-server 拉起来、
