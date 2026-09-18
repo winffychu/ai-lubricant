@@ -119,14 +119,30 @@ jobs:
         run: |
           set -euo pipefail
           ref="${IN_REF:-main}"
+          # ★ 每个分支都必须给出**确定的** true/false，绝不允许空值透传。
+          #   schedule：inputs.* 全为空 → 硬编码默认。
+          #   workflow_dispatch：UI 里 boolean 一定带值，但**通过 REST API 触发时，
+          #   漏传某个 input 会让它求值为空串**（而不是取 default）—— 若原样透传，
+          #   `push: ${{ ... == 'true' }}` 得 false、`load:` 得 true，
+          #   于是"演练模式"被静默启用：构建成功、日志全绿、**但什么都没推上去**。
+          #   所以这里用 `:-` 兜底，把"空"一律解释为"用默认值"。
           if [ "${EVENT}" = "workflow_dispatch" ]; then
-            publish="${IN_PUBLISH}"
-            tests="${IN_TESTS}"
+            publish="${IN_PUBLISH:-true}"
+            tests="${IN_TESTS:-false}"
           else
             # 定时/其它事件：发布，不强制跑测试（有补丁时 build job 会自动启用）。
             publish="true"
             tests="false"
           fi
+          # 兜底之后再做一次穷举断言：宁可在这里红，也不要在 build 阶段静默不推送。
+          case "${publish}" in
+            true|false) ;;
+            *) echo "::error::publish 归一化失败，得到 '${publish}'（应为 true/false）"; exit 1 ;;
+          esac
+          case "${tests}" in
+            true|false) ;;
+            *) echo "::error::run_tests 归一化失败，得到 '${tests}'（应为 true/false）"; exit 1 ;;
+          esac
           echo "ref=${ref}" >> "$GITHUB_OUTPUT"
           echo "publish=${publish}" >> "$GITHUB_OUTPUT"
           echo "run_tests=${tests}" >> "$GITHUB_OUTPUT"
