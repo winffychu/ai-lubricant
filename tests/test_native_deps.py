@@ -6,6 +6,7 @@ and the Redis >= 6.0 version gate.
 """
 from __future__ import annotations
 
+import asyncio
 import os
 import sys
 
@@ -128,6 +129,31 @@ def test_resolve_postgres_database_falls_back_to_module_default(tmp_path, monkey
     assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
     env.write_text("# only comments\n\n", encoding="utf-8")
     assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
+
+
+def test_start_all_forwards_postgres_database_to_ensure_database(monkeypatch):
+    """``start_all(postgres_database=...)`` must reach ``postgres.ensure_database``.
+
+    No real process: ``_popen`` is stubbed and readiness/create are recorded. The
+    ``up`` / exe path used to always create the module-default DB, even when
+    ``.env`` pinned another name.
+    """
+    created: list[str] = []
+    monkeypatch.setattr(lifecycle.DepsRuntime, "_popen", lambda self, label, argv: object())
+
+    async def _ready(*_args, **_kwargs):
+        return True
+
+    monkeypatch.setattr(lifecycle.postgres, "wait_ready", _ready)
+    monkeypatch.setattr(
+        lifecycle.postgres, "ensure_database",
+        lambda exe, name=postgres.DEFAULT_DATABASE: created.append(name),
+    )
+
+    cfg = DepsConfig(postgres_exe=__import__("pathlib").Path("/x/postgres"))
+    assert asyncio.run(lifecycle.DepsRuntime(cfg).start_all(postgres_database="ai-lubricant"))
+    assert asyncio.run(lifecycle.DepsRuntime(cfg).start_all())
+    assert created == ["ai-lubricant", postgres.DEFAULT_DATABASE]
 
 
 def test_redis_version_gate_rejects_old_redis():

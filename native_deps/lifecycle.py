@@ -22,6 +22,7 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
+from dotenv import dotenv_values
 from loguru import logger
 
 from . import binaries, clickhouse, layout, postgres, redis
@@ -48,46 +49,19 @@ def _env_default(key: str, default: str) -> str:
     return os.environ.get(key, default)
 
 
-def _read_env_file(env_file: Path) -> dict[str, str]:
-    """Parse ``KEY=VALUE`` lines from an env file (blanks/comments ignored)."""
-    values: dict[str, str] = {}
-    if not env_file.exists():
-        return values
-    for line in env_file.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#") or "=" not in stripped:
-            continue
-        key, _, value = stripped.partition("=")
-        value = value.strip()
-        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
-            value = value[1:-1]
-        values[key.strip()] = value
-    return values
-
-
 def resolve_postgres_database(env_file: Path) -> str:
     """Return the *actual* database name the app will connect to.
 
-    Mirrors the app's own resolution exactly (``server/bootstrap_config.py``):
-
-    * the value is looked up under **both** ``POSTGRES_DATABASE`` and the legacy
-      alias ``POSTGRES_DB``, first non-empty wins — the app uses
-      ``_required_text(("POSTGRES_DATABASE", "POSTGRES_DB"), ...)``;
-    * real environment variables win over the ``.env`` file, matching
-      ``python-dotenv``'s ``override=False``: the file is merged *under* the
-      environment, not consulted in a second pass. (Merging matters: with
-      ``.env`` holding ``POSTGRES_DATABASE=A`` and the environment holding
-      ``POSTGRES_DB=B``, a two-pass lookup would pick ``B`` while the app picks
-      ``A`` — and we would create the wrong database.)
-
-    Using the resolved name instead of :data:`postgres.DEFAULT_DATABASE` is
-    mandatory: ``.env.example`` / ``docker-compose.yml`` ship
-    ``POSTGRES_DATABASE=ai-lubricant`` while the module default is
-    ``ai_lubricant`` — creating the wrong one leaves the target DB missing and
-    the app still fails with ``InvalidCatalogNameError``.
+    Mirrors ``server/bootstrap_config.py``'s
+    ``_required_text(("POSTGRES_DATABASE", "POSTGRES_DB"), ...)`` lookup order,
+    with real environment variables winning over the file (``dotenv_values`` +
+    merge == python-dotenv's ``override=False``). The resolved name matters:
+    ``.env.example`` / ``docker-compose.yml`` ship
+    ``POSTGRES_DATABASE=ai-lubricant`` while :data:`postgres.DEFAULT_DATABASE`
+    is ``ai_lubricant`` — creating the wrong one leaves the target DB missing.
     """
-    merged = dict(_read_env_file(env_file))
-    merged.update(os.environ)  # dotenv override=False：真实环境变量优先
+    merged = {k: v for k, v in dotenv_values(env_file).items() if v is not None}
+    merged.update(os.environ)
     for name in ("POSTGRES_DATABASE", "POSTGRES_DB"):
         value = (merged.get(name) or "").strip()
         if value:
@@ -137,45 +111,18 @@ async def _ensure_or_none(kind: str, *, required: bool) -> Path | None:
 async def ensure_databases(cfg: DepsConfig, env_file: Path) -> None:
     """Start the local DBs once, create the target databases, then stop them.
 
-    Idempotent. Required by the supervisord shape: :func:`ensure_all` only runs
-    ``initdb`` and never starts a process, while ``ensure_database`` otherwise
-    lives on the :class:`DepsRuntime` path (``up`` / exe) — so supervisord would
-    start the app programs against a database that does not exist yet, and they
-    would restart until FATAL with ``InvalidCatalogNameError``. Same approach the
-    codespace entrypoint used inline.
+    Required by the supervisord shape: :func:`ensure_all` only runs ``initdb``
+    and never starts a process, while ``ensure_database`` otherwise lives on the
+    :class:`DepsRuntime` path — without this the app programs would start
+    against a database that does not exist yet and restart until FATAL with
+    ``InvalidCatalogNameError``.
     """
-    if cfg.postgres_local and cfg.postgres_exe is not None:
-        database = resolve_postgres_database(env_file)
-        child = subprocess.Popen(postgres.start_command(cfg.postgres_exe))
-        try:
-            if not await postgres.wait_ready(cfg.postgres_exe, timeout=60):
-                raise RuntimeError("postgres did not become ready; cannot create database")
-            postgres.ensure_database(cfg.postgres_exe, database)
-            logger.info("[native-deps] postgres database ensured: {}", database)
-        finally:
-            with contextlib.suppress(Exception):
-                postgres.stop(cfg.postgres_exe)
-            with contextlib.suppress(Exception):
-                child.wait(timeout=15)
-            if child.poll() is None:
-                with contextlib.suppress(Exception):
-                    child.kill()
-    if cfg.clickhouse_enabled and cfg.clickhouse_exe is not None:
-        child = subprocess.Popen(clickhouse.start_command(cfg.clickhouse_exe))
-        try:
-            if await clickhouse.wait_ready():
-                clickhouse.ensure_database(cfg.clickhouse_exe)
-                logger.info("[native-deps] clickhouse database ensured: {}", clickhouse.DEFAULT_DATABASE)
-            else:
-                logger.warning("[native-deps] clickhouse not ready; skipping database create (optional)")
-        finally:
-            with contextlib.suppress(Exception):
-                clickhouse.stop(cfg.clickhouse_exe)
-            with contextlib.suppress(Exception):
-                child.wait(timeout=15)
-            if child.poll() is None:
-                with contextlib.suppress(Exception):
-                    child.kill()
+    runtime = DepsRuntime(cfg)
+    try:
+        if not await runtime.start_all(postgres_database=resolve_postgres_database(env_file)):
+            raise RuntimeError("native dependencies did not become ready; cannot create databases")
+    finally:
+        runtime.stop_all()
 
 
 def env_updates(cfg: DepsConfig) -> dict[str, str]:
@@ -314,7 +261,7 @@ class DepsRuntime:
         self._procs.append((label, proc))
         return proc
 
-    async def start_all(self) -> bool:
+    async def start_all(self, *, postgres_database: str | None = None) -> bool:
         cfg = self._cfg
         if cfg.postgres_local and cfg.postgres_exe is not None:
             self._popen("postgres", postgres.start_command(cfg.postgres_exe))
@@ -322,7 +269,7 @@ class DepsRuntime:
                 logger.error("[native-deps] postgres did not become ready")
                 return False
             with contextlib.suppress(Exception):
-                postgres.ensure_database(cfg.postgres_exe)
+                postgres.ensure_database(cfg.postgres_exe, postgres_database or postgres.DEFAULT_DATABASE)
         if cfg.redis_local and cfg.redis_exe is not None:
             self._popen("redis", redis.start_command(cfg.redis_exe))
             if not await redis.wait_ready():

@@ -54,7 +54,7 @@ async def cmd_up(args: argparse.Namespace) -> int:
     cfg = await lifecycle.ensure_all()
     lifecycle.write_env_file(env_file, lifecycle.env_updates(cfg))
     deps = lifecycle.DepsRuntime(cfg)
-    if not await deps.start_all():
+    if not await deps.start_all(postgres_database=lifecycle.resolve_postgres_database(env_file)):
         logger.error("[native-deps] dependency startup failed; aborting")
         deps.stop_all()
         return 1
