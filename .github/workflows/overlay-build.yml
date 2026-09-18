@@ -95,7 +95,8 @@ jobs:
   # 单独一个 job 先把 SHA 定死，后续所有步骤都用它，保证「日志里看到的 SHA」与
   # 「真正被构建的 SHA」是同一个值。
   # 选项也在这里归一化：schedule 触发时 inputs.* 全为空，必须显式给默认值，
-  # 否则 `push: ${{ inputs.publish }}` 会变成空串 → 定时构建永远不推送。
+  # 否则 build job 里直接引用 inputs.publish 的写法会得到空串 → 定时构建永远不推送。
+  # （注释里不写 GitHub 表达式字面形式：解析器会扫描全文，非法表达式会让整个文件解析失败。）
   resolve:
     name: 解析上游提交与选项
     runs-on: ubuntu-latest
@@ -123,9 +124,14 @@ jobs:
           #   schedule：inputs.* 全为空 → 硬编码默认。
           #   workflow_dispatch：UI 里 boolean 一定带值，但**通过 REST API 触发时，
           #   漏传某个 input 会让它求值为空串**（而不是取 default）—— 若原样透传，
-          #   `push: ${{ ... == 'true' }}` 得 false、`load:` 得 true，
-          #   于是"演练模式"被静默启用：构建成功、日志全绿、**但什么都没推上去**。
-          #   所以这里用 `:-` 兜底，把"空"一律解释为"用默认值"。
+          #   build job 里那两处 push / load 的布尔表达式会双双走偏：
+          #   push 得 false、load 得 true，于是"演练模式"被静默启用 ——
+          #   构建成功、日志全绿、**但什么都没推上去**。所以这里用 `:-` 兜底，
+          #   把"空"一律解释为"用默认值"。
+          #   ⚠️ 注意：注释里**不要**写 GitHub 表达式字面形式（哪怕只是示意）——
+          #   工作流解析器会扫描全文，遇到非法表达式会让**整个文件解析失败**
+          #   （表现为 dispatch 直接返回 422 / 工作流在 Actions 页面不可用）。
+          #   这里只用自然语言描述。
           if [ "${EVENT}" = "workflow_dispatch" ]; then
             publish="${IN_PUBLISH:-true}"
             tests="${IN_TESTS:-false}"
