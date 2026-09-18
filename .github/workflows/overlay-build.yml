@@ -1,0 +1,480 @@
+# Overlay 构建：把上游源码**完全移出本仓库**，构建时再 clone。
+#
+# ── 这个工作流要证明的命题 ────────────────────────────────────────────────
+#   「我们的仓库即便不保留任何上游源代码，也完全可以独立完成构建流程。」
+#
+# 证明方式不是论述，而是**构造 + 断言**：
+#   1. 构建上下文是一个**全新 clone 出来的上游目录**（$GITHUB_WORKSPACE/upstream-src），
+#      本仓库只被 checkout 到 $GITHUB_WORKSPACE/overlay，仅用于提供 patches/。
+#   2. 断言构建上下文的 origin 指向上游、HEAD 等于本次解析出的上游 SHA。
+#   3. 断言 $CTX/.github **不存在** —— 上游的 .github/ 是空的，本仓库的 .github/ 里有
+#      5 个 workflow；一旦本仓库有任何文件泄漏进构建上下文，这个断言立刻失败。
+#      这是最直接的「零泄漏」探针。
+#   4. 零补丁时断言 `git -C $CTX status --porcelain` 为空 ⇒ 构建上下文与上游提交
+#      **逐字节相同** ⇒ 构建结果与「我们仓库里有没有源码」完全无关。
+#
+# ── 为什么这条路比「fork 里放源码 + sed 打补丁」干净 ──────────────────────
+#   * 冲突面归零：本仓库不持有上游文件，就不存在 merge 冲突，也不需要每周
+#     `git merge --no-ff` + 冲突开 issue 的那套机制。
+#   * 子模块的相对 URL 自动正确：.gitmodules 写的是 `../ai-lubricant-*.git`，
+#     相对 **origin** 解析。从上游 clone → 解析成 wuxin-gh/ai-lubricant-*（存在）；
+#     从我们 fork clone → 解析成 winffychu/ai-lubricant-*（不存在）。
+#     也就是说，现有 docker-publish.yml / ci.yml / acceptance.yml 里那句
+#     `git config url."https://github.com/wuxin-gh/".insteadOf "https://github.com/winffychu/"`
+#     是个**纯粹由 fork 引入的补丁**，overlay 方式下自动消失。
+#   * 上游更新即生效：不需要同步、不需要合并、不存在"落后上游"这个状态。
+#
+# ── 补丁机制 ──────────────────────────────────────────────────────────────
+#   本仓库对上游源码的任何改动都表达为 `.github/patches/*.patch`，按文件名排序依次
+#   `git apply`。**当前补丁数为 0** —— 因为我们已把与上游的差异收敛到「5 个纯新增的
+#   .github/ 文件、零上游文件修改」。所以今天这条流水线就是纯粹的
+#   「clone 上游 → 构建 → 推送」，补丁机制是留给将来的余量，不是现在的必需品。
+#   补丁应用失败即**硬失败**（不是警告）：宁可红，不可发出一个来源不明的镜像。
+#
+# ── 与既有流水线的关系 ────────────────────────────────────────────────────
+#   本工作流是**新增**的并行通道，默认只推 `overlay-*` 标签，**不碰 `latest`**，
+#   因此不会影响现有生产链路。验收通过后，把下面 TAG_PREFIX 改为空并去掉
+#   `latest` 的隔离即可整体切换（同时退役 docker-publish.yml 并清掉仓库里的上游源码）。
+
+name: Overlay Build (clone upstream → patch → build)
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "要构建的上游 ref（分支/tag/完整 SHA）。默认 main = 上游最新。"
+        required: false
+        default: "main"
+        type: string
+      version:
+        description: "可核验版本号（写进镜像 APP_VERSION）。留空 = upstream-<7hex>。"
+        required: false
+        default: ""
+        type: string
+      publish:
+        description: "是否推送到 GHCR。取消勾选 = 只构建到本地 daemon（演练）。"
+        required: false
+        default: true
+        type: boolean
+      run_tests:
+        description: "是否在构建前跑上游测试套件（有补丁时建议开启）。"
+        required: false
+        default: false
+        type: boolean
+
+# 绝不并发：避免两次构建争抢同一批 overlay-* 标签。
+concurrency:
+  group: overlay-build
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  UPSTREAM_REPO: wuxin-gh/ai-lubricant
+  UPSTREAM_URL: https://github.com/wuxin-gh/ai-lubricant.git
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}
+  CTX: ${{ github.workspace }}/upstream-src
+  OVERLAY: ${{ github.workspace }}/overlay
+  # 隔离前缀：切换生产时置空。
+  TAG_PREFIX: "overlay-"
+
+jobs:
+  # ── 解析上游 SHA ──────────────────────────────────────────────────────────
+  # 单独一个 job 先把 SHA 定死，后续所有步骤都用这个 SHA，保证「日志里看到的
+  # SHA」与「真正被构建的 SHA」是同一个值。
+  resolve:
+    name: 解析上游提交
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      sha: ${{ steps.r.outputs.sha }}
+      short: ${{ steps.r.outputs.short }}
+    steps:
+      - name: 解析 ${{ inputs.upstream_ref }} 的提交 SHA
+        id: r
+        env:
+          REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "${UPSTREAM_URL}" "${REF}" | head -1 | cut -f1)"
+          if [ -z "${sha}" ]; then
+            # 分支/tag 没命中时，按「调用方直接给了 SHA」再试一次。
+            case "${REF}" in
+              [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) sha="${REF}" ;;
+              *) echo "::error::无法解析上游 ref '${REF}'"; exit 1 ;;
+            esac
+          fi
+          echo "sha=${sha}" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:7}" >> "$GITHUB_OUTPUT"
+          echo "上游 ${UPSTREAM_REPO}@${REF} = ${sha}"
+
+  # ── 构建 ──────────────────────────────────────────────────────────────────
+  build:
+    name: clone 上游 → 打补丁 → 构建
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    # 仅 run_tests 时需要；services 会无条件起，成本可忽略。
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ai_lubricant
+          POSTGRES_PASSWORD: ai_lubricant
+          POSTGRES_DB: ai-lubricant
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U ai_lubricant -d ai-lubricant"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s --health-timeout 5s --health-retries 20
+
+    env:
+      UPSTREAM_SHA: ${{ needs.resolve.outputs.sha }}
+      POSTGRES_HOST: 127.0.0.1
+      POSTGRES_PORT: "5432"
+      POSTGRES_USER: ai_lubricant
+      POSTGRES_PASSWORD: ai_lubricant
+      POSTGRES_DATABASE: ai-lubricant
+      REDIS_HOST: 127.0.0.1
+      REDIS_PORT: "6379"
+
+    steps:
+      # 本仓库只用来提供 patches/。注意 checkout 到子目录 overlay/，
+      # 与构建上下文 upstream-src/ 完全分离。
+      - name: Checkout 本仓库（仅取补丁）
+        uses: actions/checkout@v4
+        with:
+          path: overlay
+
+      # 关键：这里 clone 的是**上游**，不是我们自己的仓库。
+      # 不 --recurse-submodules：.dockerignore 只放行 node_server/ 与 user-frontend/，
+      # 其余 3 个子模块（nodes/mobile/device-control）不进构建上下文，不必下载。
+      # 相对 URL 会自然解析到 wuxin-gh/ai-lubricant-*，无需任何 insteadOf 改写。
+      - name: clone 上游到构建上下文
+        env:
+          REF: ${{ inputs.upstream_ref }}
+        run: |
+          set -euo pipefail
+          # 用 init + fetch 而不是 `clone --branch`：上游 ref 可能是分支/tag，也可能是
+          # 直接给的完整 SHA；fetch 能覆盖三种，`--branch` 只覆盖前两种。
+          # remote 必须叫 origin —— .gitmodules 的相对 URL（../ai-lubricant-*.git）
+          # 是相对 origin 解析的，名字错了子模块就拉不到。
+          git init -q "${CTX}"
+          git -C "${CTX}" remote add origin "${UPSTREAM_URL}"
+          if ! git -C "${CTX}" fetch --depth 1 origin "${UPSTREAM_SHA}" 2>/dev/null; then
+            echo "· 按 SHA fetch 未成功，回退为按 ref '${REF}' fetch"
+            git -C "${CTX}" fetch --depth 1 origin "${REF}"
+          fi
+          git -C "${CTX}" checkout -q --detach FETCH_HEAD
+          # 不 --recurse-submodules 全拉：.dockerignore 只放行 node_server/ 与
+          # user-frontend/，其余 3 个子模块（nodes/mobile/device-control）不进
+          # 构建上下文，没必要下载。
+          # 相对 URL 会自然解析到 wuxin-gh/ai-lubricant-*，无需任何 insteadOf 改写。
+          git -C "${CTX}" submodule update --init --recursive --depth 1 \
+            node_server user-frontend
+
+      - name: 应用补丁（.github/patches/*.patch，按文件名排序）
+        id: patch
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          patches=("${OVERLAY}"/.github/patches/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "补丁数 = 0（本仓库对上游源码零改动），跳过"
+            echo "count=0" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          for p in "${patches[@]}"; do
+            echo "── 应用 $(basename "$p")"
+            if ! git -C "${CTX}" apply -p1 --index --whitespace=nowarn "$p"; then
+              echo "::error file=${p}::补丁应用失败。上游很可能改动了该补丁涉及的行；"\
+          "请把补丁 rebase 到 ${UPSTREAM_SHA} 后重新提交。拒绝继续构建。"
+              exit 1
+            fi
+          done
+          echo "count=${#patches[@]}" >> "$GITHUB_OUTPUT"
+          echo "已应用 ${#patches[@]} 个补丁"
+
+      # ── 可行性论证的机器可验证部分 ────────────────────────────────────────
+      - name: 断言构建上下文 100% 来自上游（零泄漏）
+        run: |
+          set -euo pipefail
+
+          echo "构建上下文 = ${CTX}"
+          echo "本仓库检出 = ${OVERLAY}（只提供补丁）"
+          echo
+
+          # 1) 上下文必须是独立于本仓库的另一个 git 仓库。
+          ctx_root="$(git -C "${CTX}" rev-parse --show-toplevel)"
+          [ "${ctx_root}" != "${OVERLAY}" ] \
+            || { echo "::error::构建上下文就是本仓库的检出，断言失败"; exit 1; }
+
+          # 2) 它的 origin 必须指向上游。
+          origin="$(git -C "${CTX}" remote get-url origin)"
+          [ "${origin}" = "${UPSTREAM_URL}" ] \
+            || { echo "::error::上下文 origin=${origin}，不是上游"; exit 1; }
+
+          # 3) 它的 HEAD 必须是本次解析出的上游 SHA。
+          head_sha="$(git -C "${CTX}" rev-parse HEAD)"
+          [ "${head_sha}" = "${UPSTREAM_SHA}" ] \
+            || { echo "::error::上下文 HEAD=${head_sha} != 上游 ${UPSTREAM_SHA}"; exit 1; }
+
+          # 4) ★ 零泄漏探针：上游的 .github/ 是空的，本仓库的 .github/ 里有 5 个
+          #    workflow。若本仓库任何文件混入上下文，这里必然命中。
+          if [ -e "${CTX}/.github" ]; then
+            echo "::error::构建上下文里出现了 .github/ —— 本仓库的文件泄漏进了构建上下文"
+            ls -la "${CTX}/.github" || true
+            exit 1
+          fi
+
+          # 5) 零补丁 ⇒ 工作区必须干净 ⇒ 上下文与上游提交逐字节相同。
+          dirty="$(git -C "${CTX}" status --porcelain)"
+          if [ "${{ steps.patch.outputs.count }}" = "0" ] && [ -n "${dirty}" ]; then
+            echo "::error::零补丁但工作区不干净，上下文并非纯上游："
+            echo "${dirty}"; exit 1
+          fi
+
+          # 6) 构建必需的两个子模块必须真的有内容。
+          for d in node_server user-frontend/dist; do
+            [ -n "$(ls -A "${CTX}/${d}" 2>/dev/null)" ] \
+              || { echo "::error::子模块目录 ${d} 为空，构建上下文不完整"; exit 1; }
+          done
+
+          {
+            echo "### 构建上下文来源断言：全部通过"
+            echo ""
+            echo "| 断言 | 值 |"
+            echo "|---|---|"
+            echo "| 上下文 origin | \`${origin}\` |"
+            echo "| 上下文 HEAD | \`${head_sha}\` |"
+            echo "| 与上游提交一致 | ✅ |"
+            echo "| 上下文内 \`.github/\` | ❌ 不存在（零泄漏） |"
+            echo "| 补丁数 | ${{ steps.patch.outputs.count }} |"
+            echo "| 工作区改动 | \`${dirty:-<无>}\` |"
+            echo ""
+            echo "⇒ 构建上下文与本仓库的内容**无关**：本仓库即使一个上游源文件都没有，"
+            echo "  本 job 依然产出完全相同的镜像。"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 构建前置检查（Dockerfile / requirements.txt 存在）
+        run: |
+          set -euo pipefail
+          for f in Dockerfile requirements.txt .dockerignore .env.example; do
+            [ -f "${CTX}/${f}" ] || { echo "::error::上下文缺少 ${f}"; exit 1; }
+          done
+          echo "构建上下文文件数: $(find "${CTX}" -type f | wc -l)"
+
+      - name: 运行上游测试套件（可选）
+        if: inputs.run_tests
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          pip install -r "${CTX}/requirements.txt"
+          pip install "pytest==9.1.1" "pytest-asyncio==1.4.0" pytest-timeout
+          # 与 ci.yml 一致：这两个文件依赖 gitignored 的 specs/，全新 checkout 里不存在。
+          cd "${CTX}"
+          python -m pytest -q --timeout=300 --timeout-method=thread \
+            --ignore=tests/test_eaichat_fence_json_aware.py \
+            --ignore=tests/test_eaichat_stream_fixtures.py
+
+      - name: Set up QEMU / Buildx
+        uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR
+        if: inputs.publish
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 生成标签与版本号
+        id: ver
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "${INPUT_VERSION}" ]; then
+            v="${INPUT_VERSION}"
+          else
+            v="upstream-${{ needs.resolve.outputs.short }}"
+          fi
+          echo "version=${v}" >> "$GITHUB_OUTPUT"
+          tags="${IMAGE}:${TAG_PREFIX}${{ needs.resolve.outputs.short }},${IMAGE}:${TAG_PREFIX}latest"
+          if [ -n "${INPUT_VERSION}" ]; then tags="${tags},${IMAGE}:${INPUT_VERSION}"; fi
+          echo "tags=${tags}" >> "$GITHUB_OUTPUT"
+          echo "版本号 = ${v}"
+          echo "标签   = ${tags}"
+
+      - name: 构建（上下文 = 上游 clone）
+        uses: docker/build-push-action@v6
+        with:
+          # ★ 注意：context 指向上游 clone，**不是** `.`
+          context: ${{ env.CTX }}
+          file: ${{ env.CTX }}/Dockerfile
+          # 多架构镜像只能 push（daemon 存不下 manifest list），所以演练模式退化为单平台。
+          platforms: ${{ inputs.publish && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ inputs.publish }}
+          load: ${{ !inputs.publish }}
+          tags: ${{ steps.ver.outputs.tags }}
+          build-args: |
+            PIP_INDEX_URL=https://pypi.org/simple
+            DOCKER_REGISTRY_PREFIX=
+            APP_VERSION=${{ steps.ver.outputs.version }}
+          # 来源可追溯：镜像元数据直接声明上游仓库与上游提交。
+          labels: |
+            org.opencontainers.image.title=ai-lubricant (overlay build)
+            org.opencontainers.image.source=https://github.com/${{ env.UPSTREAM_REPO }}
+            org.opencontainers.image.revision=${{ needs.resolve.outputs.sha }}
+            org.opencontainers.image.version=${{ steps.ver.outputs.version }}
+          cache-from: type=gha,scope=overlay
+          cache-to: type=gha,mode=max,scope=overlay
+
+      - name: 汇总
+        if: always()
+        run: |
+          {
+            echo "## Overlay 构建"
+            echo ""
+            echo "| 项 | 值 |"
+            echo "|---|---|"
+            echo "| 上游 | \`${UPSTREAM_REPO}\` |"
+            echo "| 上游提交 | \`${UPSTREAM_SHA}\` |"
+            echo "| 构建上下文 | \`upstream-src/\`（上游 clone，非本仓库） |"
+            echo "| 补丁数 | ${{ steps.patch.outputs.count }} |"
+            echo "| 镜像 | \`${{ steps.ver.outputs.tags }}\` |"
+            echo "| 版本号 | \`${{ steps.ver.outputs.version }}\` |"
+            echo "| 推送 | ${{ inputs.publish }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── 验收：把**刚推上去的**镜像拉回来真跑 ─────────────────────────────────
+  # 这一步是「构建成功」与「镜像能用」之间的分界。只看 build 绿是不够的。
+  verify:
+    name: 拉取已发布镜像并冒烟
+    needs: [resolve, build]
+    if: inputs.publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      REF: ghcr.io/${{ github.repository }}:overlay-${{ needs.resolve.outputs.short }}
+
+    steps:
+      - name: 登录 GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 拉取刚发布的镜像（并记录 digest）
+        run: |
+          set -euo pipefail
+          docker pull "${REF}"
+          digest="$(docker inspect --format '{{index .RepoDigests 0}}' "${REF}")"
+          echo "REF=${REF}" >> "$GITHUB_ENV"
+          echo "DIGEST=${digest}" >> "$GITHUB_ENV"
+          echo "拉取到 ${digest}"
+
+      # 只用上游的 .env.example 作为模板，不依赖本仓库的任何文件。
+      - name: 取上游 .env.example（稀疏检出，只拉这一个文件）
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --filter=blob:none --no-checkout \
+            https://github.com/${UPSTREAM_REPO}.git meta
+          git -C meta sparse-checkout set --no-cone .env.example
+          git -C meta checkout
+          test -f meta/.env.example
+
+      - name: 生成 .env（对齐 .env.example，填充必填密钥与内网服务名）
+        run: |
+          python - <<'PY'
+          import pathlib, secrets
+          text = pathlib.Path("meta/.env.example").read_text(encoding="utf-8")
+          text = text.replace("POSTGRES_HOST=127.0.0.1", "POSTGRES_HOST=postgres")
+          text = text.replace("REDIS_HOST=127.0.0.1", "REDIS_HOST=redis")
+          text = text.replace("POSTGRES_USER=your_pg_user", "POSTGRES_USER=ai_lubricant")
+          text = text.replace("POSTGRES_PASSWORD=your_pg_password", "POSTGRES_PASSWORD=ai_lubricant")
+          text = text.replace("NODE_CONTROL_TOKEN=", "NODE_CONTROL_TOKEN=" + secrets.token_urlsafe(32))
+          text = text.replace("NODE_CREDENTIAL_ENCRYPTION_KEY=", "NODE_CREDENTIAL_ENCRYPTION_KEY=" + secrets.token_hex(32))
+          text = text.replace("AGENT_ATTACHMENT_SIGNING_KEY=", "AGENT_ATTACHMENT_SIGNING_KEY=" + secrets.token_urlsafe(48))
+          pathlib.Path(".env").write_text(text, encoding="utf-8")
+          print("wrote .env")
+          PY
+
+      - name: 起 PG / Redis
+        run: |
+          set -euo pipefail
+          docker network create ai-lubricant-ov
+          docker run -d --name postgres --network ai-lubricant-ov \
+            -e POSTGRES_USER=ai_lubricant -e POSTGRES_PASSWORD=ai_lubricant \
+            -e POSTGRES_DB=ai-lubricant -e TZ=Asia/Shanghai postgres:16-alpine
+          docker run -d --name redis --network ai-lubricant-ov \
+            redis:7-alpine redis-server --maxmemory-policy noeviction --appendonly yes
+          for i in $(seq 1 60); do
+            docker exec postgres pg_isready -U ai_lubricant -d ai-lubricant >/dev/null 2>&1 && break
+            sleep 2
+          done
+          for i in $(seq 1 60); do
+            [ "$(docker exec redis redis-cli ping 2>/dev/null)" = "PONG" ] && break
+            sleep 2
+          done
+
+      - name: 运行镜像
+        run: |
+          set -euo pipefail
+          docker run -d --name ai-lubricant --network ai-lubricant-ov \
+            --env-file .env \
+            -e POSTGRES_HOST=postgres -e POSTGRES_PORT=5432 \
+            -e POSTGRES_USER=ai_lubricant -e POSTGRES_PASSWORD=ai_lubricant \
+            -e POSTGRES_DATABASE=ai-lubricant \
+            -e REDIS_HOST=redis -e REDIS_PORT=6379 \
+            -e SERVER_PORT=8001 -e DEBUG=false \
+            -p 3006:8001 "${REF}"
+
+      - name: 冒烟（轮询 /mcp/health，校验 /v1/models）
+        run: |
+          set -euo pipefail
+          ok=0
+          for i in $(seq 1 90); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://localhost:3006/mcp/health || true)
+            echo "attempt $i: /mcp/health -> $code"
+            [ "$code" = "200" ] && { ok=1; break; }
+            [ "$(docker inspect -f '{{.State.Running}}' ai-lubricant 2>/dev/null)" = "true" ] \
+              || { echo "container exited early"; break; }
+            sleep 5
+          done
+          [ "$ok" = "1" ] || { echo "::error::/mcp/health 未在预期时间内返回 200"; exit 1; }
+          curl -fsS http://localhost:3006/mcp/health; echo
+          curl -fsS -o /dev/null -w 'GET /v1/models -> %{http_code}\n' http://localhost:3006/v1/models
+
+      - name: 核验镜像内版本标识（上游原生 APP_VERSION）
+        run: |
+          set -euo pipefail
+          echo "镜像内 APP_VERSION = $(docker exec ai-lubricant printenv APP_VERSION)"
+          echo "镜像 OCI 来源标注："
+          docker image inspect "${REF}" \
+            --format '{{index .Config.Labels "org.opencontainers.image.source"}} @ {{index .Config.Labels "org.opencontainers.image.revision"}}'
+
+      - name: 失败时导出日志
+        if: failure()
+        run: |
+          echo "===== ai-lubricant ====="; docker logs ai-lubricant --tail 300 || true
+          echo "===== postgres ====="; docker logs postgres --tail 80 || true
+          echo "===== redis ====="; docker logs redis --tail 80 || true
+
+      - name: 清理
+        if: always()
+        run: |
+          docker rm -f ai-lubricant postgres redis >/dev/null 2>&1 || true
+          docker network rm ai-lubricant-ov >/dev/null 2>&1 || true
