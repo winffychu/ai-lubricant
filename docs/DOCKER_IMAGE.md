@@ -73,7 +73,7 @@ ghcr.io/<owner>/ai-lubricant:<tag>
   `--build-arg PIP_INDEX_URL=https://pypi.org/simple` 直连 PyPI。
 - **认证**：使用仓库自带的 `GITHUB_TOKEN` 推送到本仓库的 GHCR，无需额外密钥。需在
   仓库 **Settings → Actions → General → Workflow permissions** 允许写 packages。
-- **构建上下文**：由 `.dockerignore` 收敛，仅保留运行时业务文件（见第五节）。
+- **构建上下文**：由 `.dockerignore` 收敛，仅保留运行时业务文件（见第六节）。
 
 ### 首次发布后：把 GHCR 包设为公开（可选）
 
@@ -97,9 +97,9 @@ GHCR 包默认继承仓库可见性。若要让他人免登录拉取，在仓库
 或直接用环境变量覆盖共享 tag（不改文件）：
 
 ```bash
-# 先拉取发布镜像
-docker pull ghcr.io/wuxin-gh/ai-lubricant:v260917.1
-docker tag  ghcr.io/wuxin-gh/ai-lubricant:v260917.1 ai-lubricant:local
+# 先拉取发布镜像（生产口径 latest，见第四节）
+docker pull ghcr.io/wuxin-gh/ai-lubricant:latest
+docker tag  ghcr.io/wuxin-gh/ai-lubricant:latest ai-lubricant:local
 # compose 中 TAG=local 时，三个服务都会复用这个本地 tag
 docker compose up -d --force-recreate
 ```
@@ -132,7 +132,25 @@ docker run -d --name ai-lubricant \
 > → 容器不重建 → **跑的还是旧镜像**（表现为"重新构建后发布的还是旧版本"）。
 > 因此升级必须显式加 `--force-recreate`。
 
-### 版本号从哪来
+### 生产口径是 `latest`
+
+生产部署跟随 **`latest`**，不钉版本 tag、也不钉 digest。理由：`latest` 由发布链路自己
+维护（`main` 推送与 `v*` tag 推送都会更新它，见第二节），生产只管"拉最新的发布产物"，
+不需要人去记当前该用哪个 tag —— 记版本号这件事本身就会出错，也会拖慢上游跟进。
+
+由此引出一个**必须澄清的核验口径**：`latest` 是**移动标签**，而镜像内
+`AI_LUBRICANT_VERSION` 是构建时写入的 `main-<7hex>`（分支推送）或 `vYYMMDD.N`（tag 推送）。
+**它和字符串 `latest` 永远不相等**，拿它做等值断言必然误报"升级失败"。
+
+真正的判据是：**运行容器的镜像 ID == 刚拉取到的镜像 ID**。这才是"容器确实换成了新拉的
+那份镜像"的不变量，也正是"还是旧版本"故障的判据。镜像内版本只用于**人工确认**当前跑的
+是哪次构建：
+
+```bash
+docker exec ai-lubricant printenv AI_LUBRICANT_VERSION   # 信息性，不是判据
+```
+
+### 版本号从哪来（仅供追溯，不用于部署）
 
 镜像的权威发布路径是 GitHub Actions：
 
@@ -140,13 +158,9 @@ docker run -d --name ai-lubricant \
 .github/workflows/sync-upstream.yml   每周同步上游；ci.yml 通过后在 GitHub 侧生成
                                       vYYMMDD.N（如 v260917.1、v260917.2，当日序号递增）
         ↓ push tag
-.github/workflows/docker-publish.yml  用该 tag 构建并推送镜像
+.github/workflows/docker-publish.yml  用该 tag 构建并推送镜像（同时更新 latest）
 ```
 
-- **版本 tag `vYYMMDD.N` 由 `sync-upstream.yml` 生成**，人工也可以直接推一个 `vYYMMDD.N`
-  tag，或在 Actions 页面用 `workflow_dispatch` 填 `version`。
-- 镜像内置 `AI_LUBRICANT_VERSION`，**这是核验"当前跑的是哪个版本"的唯一可靠手段**：
-  tag 驱动发布时等于版本 tag，分支推送（开发构建）时为 `main-<7hex>`。
 - 关于 fork 同步的三个事实（避免重复探索）：GitHub **没有**任何内置的"定时自动同步 fork"
   能力（仓库页只有手动 Sync fork 按钮）；`POST /repos/{owner}/{repo}/merge-upstream`
   **只支持快进**；本 fork 已分叉（比上游多出若干提交），因此该 API 与 Sync fork 按钮
@@ -155,37 +169,41 @@ docker run -d --name ai-lubricant \
 ### 步骤
 
 ```bash
-# 0. 选定目标版本（见上一节；也可用 gh run list 查看最近一次发布）
-VERSION=v260917.1
-
-# 1. 拉取目标版本镜像
-docker pull ghcr.io/<owner>/ai-lubricant:$VERSION
+# 1. 拉取 latest
+docker pull ghcr.io/<owner>/ai-lubricant:latest
 
 # 2. 重新打成本地共享 tag（compose 的 ai-lubricant:${TAG:-local} 认这个名字）
-docker tag ghcr.io/<owner>/ai-lubricant:$VERSION ai-lubricant:local
+docker tag ghcr.io/<owner>/ai-lubricant:latest ai-lubricant:local
 
 # 3. 强制重建容器（关键：不加 --force-recreate 容器不会重建）
 docker compose up -d --force-recreate
 
-# 4. 核验：容器内版本必须等于 $VERSION
+# 4. 核验：容器镜像 ID 必须等于第 1 步拉到的镜像 ID
+docker inspect --format '{{.Image}}' ai-lubricant
+docker image inspect --format '{{.Id}}' ai-lubricant:local
+# 顺带看一眼实际跑的是哪次构建（信息性）
 docker exec ai-lubricant printenv AI_LUBRICANT_VERSION
 ```
 
-**第 4 步不等于 `$VERSION` 即视为升级失败**，回滚：
+> 一步完成上面 4 步：`bash script/upgrade_compose.sh`（**不带参数即 `latest`**）。
+> 脚本只做 pull / tag / up --force-recreate / 核验，**不含任何 `docker build`**；
+> 核验（镜像 ID 一致 + 容器 healthy）不通过会退出非 0 并打印回滚命令。
+
+### 例外：临时钉住某个版本 / 回滚
+
+只在**排查问题或回滚**时使用，不是常规部署方式：
 
 ```bash
-docker tag ghcr.io/<owner>/ai-lubricant:<上一个版本> ai-lubricant:local
-docker compose up -d --force-recreate
+bash script/upgrade_compose.sh v260917.2            # 钉到某个版本 tag
+REF=sha256:1108cd55… bash script/upgrade_compose.sh # 钉到 digest（回滚到"某一份确切镜像"）
 ```
 
-> 也可以直接用 `bash script/upgrade_compose.sh <VERSION>` 一步完成上面 4 步
-> （脚本只做 pull / tag / up --force-recreate / 版本核验，**不含任何 `docker build`**；
-> 核验不一致会退出非 0 并打印回滚命令）。
+回滚后记得回到 `latest` 口径，否则会永久停在钉住的版本上。
 
 ### 反向验证（证明 `--force-recreate` 是必需的）
 
 在同一台机器上：旧版本在跑时，**跳过 `--force-recreate` 只执行 `docker compose up -d`**
-→ `docker exec ai-lubricant printenv AI_LUBRICANT_VERSION` **不变**（仍是旧版本）。
+→ `docker inspect --format '{{.Image}}' ai-lubricant` 指向的仍是旧镜像 ID（版本标识也不变）。
 这一步说明"镜像换了但容器没重建"，也是排查"还是旧版本"类问题的第一现场。
 
 ## 五、发布到其他镜像仓库
@@ -208,9 +226,11 @@ env:
 
 - 版本控制/IDE、Python 构建产物、本地工具目录；
 - 文档（`README.md` / `AGENTS.md` / `docs-site/` / `script/` / `specs/` / `archive/`）；
-- 与服务器镜像无关的子模块（`mobile/` / `nodes/` / `device-control/` / `desktop/`）；
-- **开发过程残留**（`.stage2-server-progress.md` / `.stage3-wda-job-progress.md` /
-  `.footer-verify.js`）——本次补充排除，避免随 `COPY . .` 打进发布镜像。
+- 与服务器镜像无关的子模块（`mobile/` / `nodes/` / `device-control/` / `desktop/`）。
+
+> `.dockerignore` **保持上游原样**，本 fork 不追加任何排除项。原因：GitHub Actions 构建是
+> 全新 checkout，未跟踪的本地残留文件根本不在构建上下文里，加排除项对 CI 无效；而对本地
+> 构建有效的那几行，会让这个文件每周同步上游时多一个冲突点。
 
 `node_server/` 与 `user-frontend/` 随镜像发布；`user-frontend/node_modules/` 排除。
 
