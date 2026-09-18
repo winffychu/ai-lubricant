@@ -7,10 +7,6 @@ Two layers:
   * :class:`DepsRuntime` — spawns the three DB processes as children, waits
     for protocol-level readiness, creates databases, tears them down on exit.
     Used by the exe and Linux-single-file shapes.
-
-:func:`ensure_databases` bridges the two: the supervisord shape has no
-:class:`DepsRuntime`, so it calls this once before generating the conf to create
-the target databases (start → wait → create → stop, idempotent).
 """
 from __future__ import annotations
 
@@ -22,7 +18,6 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-from dotenv import dotenv_values
 from loguru import logger
 
 from . import binaries, clickhouse, layout, postgres, redis
@@ -47,26 +42,6 @@ class DepsConfig:
 
 def _env_default(key: str, default: str) -> str:
     return os.environ.get(key, default)
-
-
-def resolve_postgres_database(env_file: Path) -> str:
-    """Return the *actual* database name the app will connect to.
-
-    Mirrors ``server/bootstrap_config.py``'s
-    ``_required_text(("POSTGRES_DATABASE", "POSTGRES_DB"), ...)`` lookup order,
-    with real environment variables winning over the file (``dotenv_values`` +
-    merge == python-dotenv's ``override=False``). The resolved name matters:
-    ``.env.example`` / ``docker-compose.yml`` ship
-    ``POSTGRES_DATABASE=ai-lubricant`` while :data:`postgres.DEFAULT_DATABASE`
-    is ``ai_lubricant`` — creating the wrong one leaves the target DB missing.
-    """
-    merged = {k: v for k, v in dotenv_values(env_file).items() if v is not None}
-    merged.update(os.environ)
-    for name in ("POSTGRES_DATABASE", "POSTGRES_DB"):
-        value = (merged.get(name) or "").strip()
-        if value:
-            return value
-    return postgres.DEFAULT_DATABASE
 
 
 async def ensure_all(clickhouse_enabled: bool | None = None) -> DepsConfig:
@@ -106,23 +81,6 @@ async def _ensure_or_none(kind: str, *, required: bool) -> Path | None:
             raise
         logger.warning("[native-deps] {} skipped: {}", kind, exc)
         return None
-
-
-async def ensure_databases(cfg: DepsConfig, env_file: Path) -> None:
-    """Start the local DBs once, create the target databases, then stop them.
-
-    Required by the supervisord shape: :func:`ensure_all` only runs ``initdb``
-    and never starts a process, while ``ensure_database`` otherwise lives on the
-    :class:`DepsRuntime` path — without this the app programs would start
-    against a database that does not exist yet and restart until FATAL with
-    ``InvalidCatalogNameError``.
-    """
-    runtime = DepsRuntime(cfg)
-    try:
-        if not await runtime.start_all(postgres_database=resolve_postgres_database(env_file)):
-            raise RuntimeError("native dependencies did not become ready; cannot create databases")
-    finally:
-        runtime.stop_all()
 
 
 def env_updates(cfg: DepsConfig) -> dict[str, str]:
@@ -261,7 +219,7 @@ class DepsRuntime:
         self._procs.append((label, proc))
         return proc
 
-    async def start_all(self, *, postgres_database: str | None = None) -> bool:
+    async def start_all(self) -> bool:
         cfg = self._cfg
         if cfg.postgres_local and cfg.postgres_exe is not None:
             self._popen("postgres", postgres.start_command(cfg.postgres_exe))
@@ -269,7 +227,7 @@ class DepsRuntime:
                 logger.error("[native-deps] postgres did not become ready")
                 return False
             with contextlib.suppress(Exception):
-                postgres.ensure_database(cfg.postgres_exe, postgres_database or postgres.DEFAULT_DATABASE)
+                postgres.ensure_database(cfg.postgres_exe)
         if cfg.redis_local and cfg.redis_exe is not None:
             self._popen("redis", redis.start_command(cfg.redis_exe))
             if not await redis.wait_ready():

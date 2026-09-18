@@ -6,7 +6,6 @@ and the Redis >= 6.0 version gate.
 """
 from __future__ import annotations
 
-import asyncio
 import os
 import sys
 
@@ -16,7 +15,7 @@ _proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if _proj not in sys.path:
     sys.path.insert(0, _proj)
 
-from native_deps import lifecycle, postgres, redis, sources
+from native_deps import lifecycle, redis, sources
 from native_deps.lifecycle import DepsConfig
 
 
@@ -64,96 +63,6 @@ def test_env_updates_includes_clickhouse_only_when_enabled():
     updates = lifecycle.env_updates(with_ch)
     assert updates["CLICKHOUSE_REQUEST_PAYLOAD_ENABLED"] == "true"
     assert updates["CLICKHOUSE_ADDR"].startswith("127.0.0.1:")
-
-
-def test_resolve_postgres_database_prefers_env_file_over_default(tmp_path, monkeypatch):
-    """``.env`` may pin ``ai-lubricant`` (hyphen) while the module default is
-    ``ai_lubricant`` (underscore). The resolver must follow the .env value —
-    otherwise the bootstrap creates the wrong DB and the app still fails."""
-    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
-    monkeypatch.delenv("POSTGRES_DB", raising=False)
-    env = tmp_path / ".env"
-    env.write_text("POSTGRES_DATABASE=ai-lubricant\n", encoding="utf-8")
-    assert lifecycle.resolve_postgres_database(env) == "ai-lubricant"
-    assert lifecycle.resolve_postgres_database(env) != postgres.DEFAULT_DATABASE
-
-
-def test_resolve_postgres_database_env_var_wins(tmp_path, monkeypatch):
-    monkeypatch.setenv("POSTGRES_DATABASE", "from-env")
-    monkeypatch.delenv("POSTGRES_DB", raising=False)
-    env = tmp_path / ".env"
-    env.write_text("POSTGRES_DATABASE=from-file\n", encoding="utf-8")
-    assert lifecycle.resolve_postgres_database(env) == "from-env"
-
-
-def test_resolve_postgres_database_accepts_env_alias_postgres_db(tmp_path, monkeypatch):
-    """The app reads ``_required_text(("POSTGRES_DATABASE", "POSTGRES_DB"))`` —
-    the resolver must honour the legacy alias too, otherwise it creates the
-    module-default DB while the app connects to the aliased one."""
-    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
-    monkeypatch.setenv("POSTGRES_DB", "alias-from-env")
-    env = tmp_path / ".env"
-    assert lifecycle.resolve_postgres_database(env) == "alias-from-env"
-
-
-def test_resolve_postgres_database_accepts_file_alias_postgres_db(tmp_path, monkeypatch):
-    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
-    monkeypatch.delenv("POSTGRES_DB", raising=False)
-    env = tmp_path / ".env"
-    env.write_text("POSTGRES_DB=alias-from-file\n", encoding="utf-8")
-    assert lifecycle.resolve_postgres_database(env) == "alias-from-file"
-
-
-def test_resolve_postgres_database_matches_dotenv_override_false(tmp_path, monkeypatch):
-    """``python-dotenv`` loads ``.env`` with ``override=False``: the file is
-    merged *under* the environment. So with the file holding
-    ``POSTGRES_DATABASE`` and the environment holding the alias ``POSTGRES_DB``,
-    the app keeps the **file** value (``POSTGRES_DATABASE`` wins by key order,
-    and it is present because the environment never set it).
-
-    A naive two-pass lookup (env ``POSTGRES_DB`` first, then file) would return
-    ``alias-from-env`` here and create the wrong database. This is the case that
-    pins the merge semantics.
-    """
-    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
-    monkeypatch.setenv("POSTGRES_DB", "alias-from-env")
-    env = tmp_path / ".env"
-    env.write_text("POSTGRES_DATABASE=file-wins\n", encoding="utf-8")
-    assert lifecycle.resolve_postgres_database(env) == "file-wins"
-
-
-def test_resolve_postgres_database_falls_back_to_module_default(tmp_path, monkeypatch):
-    monkeypatch.delenv("POSTGRES_DATABASE", raising=False)
-    monkeypatch.delenv("POSTGRES_DB", raising=False)
-    env = tmp_path / ".env"
-    assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
-    env.write_text("# only comments\n\n", encoding="utf-8")
-    assert lifecycle.resolve_postgres_database(env) == postgres.DEFAULT_DATABASE
-
-
-def test_start_all_forwards_postgres_database_to_ensure_database(monkeypatch):
-    """``start_all(postgres_database=...)`` must reach ``postgres.ensure_database``.
-
-    No real process: ``_popen`` is stubbed and readiness/create are recorded. The
-    ``up`` / exe path used to always create the module-default DB, even when
-    ``.env`` pinned another name.
-    """
-    created: list[str] = []
-    monkeypatch.setattr(lifecycle.DepsRuntime, "_popen", lambda self, label, argv: object())
-
-    async def _ready(*_args, **_kwargs):
-        return True
-
-    monkeypatch.setattr(lifecycle.postgres, "wait_ready", _ready)
-    monkeypatch.setattr(
-        lifecycle.postgres, "ensure_database",
-        lambda exe, name=postgres.DEFAULT_DATABASE: created.append(name),
-    )
-
-    cfg = DepsConfig(postgres_exe=__import__("pathlib").Path("/x/postgres"))
-    assert asyncio.run(lifecycle.DepsRuntime(cfg).start_all(postgres_database="ai-lubricant"))
-    assert asyncio.run(lifecycle.DepsRuntime(cfg).start_all())
-    assert created == ["ai-lubricant", postgres.DEFAULT_DATABASE]
 
 
 def test_redis_version_gate_rejects_old_redis():
