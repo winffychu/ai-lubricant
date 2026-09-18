@@ -99,7 +99,12 @@ jobs:
           REF: ${{ inputs.upstream_ref }}
         run: |
           set -euo pipefail
-          sha="$(git ls-remote "${UPSTREAM_URL}" "${REF}" | head -1 | cut -f1)"
+          # annotated tag 在 ls-remote 里会输出两行：tag 对象本身，以及以 ^{} 结尾的
+          # 「解引用后的 commit」。必须优先取后者 —— 否则 sha 会是 tag 对象的 SHA，
+          # checkout 后 HEAD 与它不等，断言 3 直接失败（即：upstream_ref 传 tag 会挂）。
+          out="$(git ls-remote "${UPSTREAM_URL}" "${REF}" || true)"
+          sha="$(printf '%s\n' "${out}" | awk '/\^\{\}$/{print $1}' | head -1)"
+          [ -n "${sha}" ] || sha="$(printf '%s\n' "${out}" | head -1 | cut -f1)"
           if [ -z "${sha}" ]; then
             # 分支/tag 没命中时，按「调用方直接给了 SHA」再试一次。
             case "${REF}" in
@@ -117,6 +122,11 @@ jobs:
     needs: resolve
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    outputs:
+      # verify 必须拉「本次构建真正推上去的那个标签」，不能自己再拼一遍：
+      # 迁移生产时 TAG_PREFIX 会被置空、tags 规则也会变，硬编码必然拉错。
+      primary_tag: ${{ steps.ver.outputs.primary }}
+      version: ${{ steps.ver.outputs.version }}
 
     # 仅 run_tests 时需要；services 会无条件起，成本可忽略。
     services:
@@ -175,12 +185,12 @@ jobs:
             git -C "${CTX}" fetch --depth 1 origin "${REF}"
           fi
           git -C "${CTX}" checkout -q --detach FETCH_HEAD
-          # 不 --recurse-submodules 全拉：.dockerignore 只放行 node_server/ 与
-          # user-frontend/，其余 3 个子模块（nodes/mobile/device-control）不进
-          # 构建上下文，没必要下载。
+          # 全量子模块，不用白名单。理由：白名单（只拉 node_server / user-frontend）
+          # 是按当前 .dockerignore 挑的，上游一旦新增或放行某个子模块，白名单就会
+          # 悄悄漏掉构建所需的目录 —— 这种失败很难查。多拉三个浅克隆只多几秒，
+          # 换掉一整类脆弱性，划算。
           # 相对 URL 会自然解析到 wuxin-gh/ai-lubricant-*，无需任何 insteadOf 改写。
-          git -C "${CTX}" submodule update --init --recursive --depth 1 \
-            node_server user-frontend
+          git -C "${CTX}" submodule update --init --recursive --depth 1
 
       - name: 应用补丁（.github/patches/*.patch，按文件名排序）
         id: patch
@@ -218,32 +228,54 @@ jobs:
           [ "${ctx_root}" != "${OVERLAY}" ] \
             || { echo "::error::构建上下文就是本仓库的检出，断言失败"; exit 1; }
 
-          # 2) 它的 origin 必须指向上游。
+          # 2) ★ 结构不变量：CTX 与 OVERLAY 必须互不包含。
+          #    两个方向都要查：
+          #      - CTX 落在 OVERLAY 内部 → 上下文其实就是本仓库的一个子目录；
+          #      - OVERLAY 落在 CTX 内部 → CTX 是工作区根，这正是 `context: .` 写错时
+          #        的形态（工作区里同时有 overlay/ 和 upstream-src/，两个都进上下文）。
+          #    只查第一个方向是不够的，第二种才是最容易犯的错。
+          case "${CTX}" in
+            "${OVERLAY}"|"${OVERLAY}"/*)
+              echo "::error::CTX 位于本仓库检出内部"; exit 1 ;;
+          esac
+          case "${OVERLAY}" in
+            "${CTX}"|"${CTX}"/*)
+              echo "::error::CTX 是本仓库检出的祖先 —— context 很可能被误设为工作区根"; exit 1 ;;
+          esac
+
+          # 3) 它的 origin 必须指向上游。
           origin="$(git -C "${CTX}" remote get-url origin)"
           [ "${origin}" = "${UPSTREAM_URL}" ] \
             || { echo "::error::上下文 origin=${origin}，不是上游"; exit 1; }
 
-          # 3) 它的 HEAD 必须是本次解析出的上游 SHA。
+          # 4) 它的 HEAD 必须是本次解析出的上游 SHA。
           head_sha="$(git -C "${CTX}" rev-parse HEAD)"
           [ "${head_sha}" = "${UPSTREAM_SHA}" ] \
             || { echo "::error::上下文 HEAD=${head_sha} != 上游 ${UPSTREAM_SHA}"; exit 1; }
 
-          # 4) ★ 零泄漏探针：上游的 .github/ 是空的，本仓库的 .github/ 里有 5 个
-          #    workflow。若本仓库任何文件混入上下文，这里必然命中。
-          if [ -e "${CTX}/.github" ]; then
-            echo "::error::构建上下文里出现了 .github/ —— 本仓库的文件泄漏进了构建上下文"
-            ls -la "${CTX}/.github" || true
+          # 5) ★ 零泄漏探针：干净 clone 里不应存在任何**未跟踪文件**。
+          #    为什么不去探测 `.github/` 是否存在：上游将来往 .github/ 加
+          #    dependabot.yml / CODEOWNERS / 自带 workflow 是完全正常的，而且
+          #    .dockerignore 并没有排除 .github/ —— 那种情况下探测会**假阳性**，
+          #    把一条好端端的链路炸掉。
+          #    正确的探针要跟"上游的目录布局"无关：本仓库的文件若混入上下文，
+          #    必然表现为未跟踪文件（不在上游那棵树里）。用 `ls-files --others`
+          #    不带 --exclude-standard，连被 .gitignore 忽略的文件也一并暴露。
+          extra="$(git -C "${CTX}" ls-files --others)"
+          if [ -n "${extra}" ]; then
+            echo "::error::构建上下文里出现未跟踪文件 —— 本仓库的文件泄漏进了构建上下文"
+            printf '%s\n' "${extra}" | head -50
             exit 1
           fi
 
-          # 5) 零补丁 ⇒ 工作区必须干净 ⇒ 上下文与上游提交逐字节相同。
+          # 6) 零补丁 ⇒ 工作区必须干净 ⇒ 上下文与上游提交逐字节相同。
           dirty="$(git -C "${CTX}" status --porcelain)"
           if [ "${{ steps.patch.outputs.count }}" = "0" ] && [ -n "${dirty}" ]; then
             echo "::error::零补丁但工作区不干净，上下文并非纯上游："
             echo "${dirty}"; exit 1
           fi
 
-          # 6) 构建必需的两个子模块必须真的有内容。
+          # 7) 构建必需的子模块必须真的有内容。
           for d in node_server user-frontend/dist; do
             [ -n "$(ls -A "${CTX}/${d}" 2>/dev/null)" ] \
               || { echo "::error::子模块目录 ${d} 为空，构建上下文不完整"; exit 1; }
@@ -257,7 +289,8 @@ jobs:
             echo "| 上下文 origin | \`${origin}\` |"
             echo "| 上下文 HEAD | \`${head_sha}\` |"
             echo "| 与上游提交一致 | ✅ |"
-            echo "| 上下文内 \`.github/\` | ❌ 不存在（零泄漏） |"
+            echo "| CTX / OVERLAY 互不包含 | ✅ |"
+            echo "| 上下文内未跟踪文件 | ❌ 无（零泄漏） |"
             echo "| 补丁数 | ${{ steps.patch.outputs.count }} |"
             echo "| 工作区改动 | \`${dirty:-<无>}\` |"
             echo ""
@@ -310,10 +343,13 @@ jobs:
             v="upstream-${{ needs.resolve.outputs.short }}"
           fi
           echo "version=${v}" >> "$GITHUB_OUTPUT"
-          tags="${IMAGE}:${TAG_PREFIX}${{ needs.resolve.outputs.short }},${IMAGE}:${TAG_PREFIX}latest"
+          primary="${IMAGE}:${TAG_PREFIX}${{ needs.resolve.outputs.short }}"
+          tags="${primary},${IMAGE}:${TAG_PREFIX}latest"
           if [ -n "${INPUT_VERSION}" ]; then tags="${tags},${IMAGE}:${INPUT_VERSION}"; fi
+          echo "primary=${primary}" >> "$GITHUB_OUTPUT"
           echo "tags=${tags}" >> "$GITHUB_OUTPUT"
           echo "版本号 = ${v}"
+          echo "主标签 = ${primary}"
           echo "标签   = ${tags}"
 
       - name: 构建（上下文 = 上游 clone）
@@ -367,7 +403,9 @@ jobs:
     timeout-minutes: 30
 
     env:
-      REF: ghcr.io/${{ github.repository }}:overlay-${{ needs.resolve.outputs.short }}
+      # 用 build job 实际推上去的主标签，不自己再拼一遍（迁移生产时 TAG_PREFIX
+      # 置空、标签规则变化，硬编码会拉到不存在或陈旧的镜像 → 假绿或误红）。
+      REF: ${{ needs.build.outputs.primary_tag }}
 
     steps:
       - name: 登录 GHCR
