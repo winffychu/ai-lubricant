@@ -27,8 +27,8 @@
 #      tag 与发布永远不会发生。对策：job 级 GH_REPO 把仓库钉死在 fork 上，且每个能接
 #      受 --repo 的调用都显式带上 --repo "${GITHUB_REPOSITORY}" 作双保险。
 #
-# 发布门槛：**仅 ci.yml 通过即发布**（acceptance.yml / codespace.yml 各 60 分钟，
-#   不纳入自动门槛，由人按需手动跑）。
+# 发布门槛：**仅 ci.yml 通过即发布**（acceptance.yml 约 60 分钟，不纳入自动门槛，
+#   由人按需手动跑；本 fork 已不再包含 codespace.yml）。
 
 name: Sync upstream & publish
 
